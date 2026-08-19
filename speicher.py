@@ -378,6 +378,16 @@ class ObsidianSync:
     END_MARK = "<!-- VP4-ENDE -->"
 
     def __init__(self, vault_path: str):
+        # Ein leerer Pfad muss abgelehnt werden, bevor daraus ein Path wird:
+        # Path("") ist in Python das AKTUELLE Verzeichnis und besteht die
+        # is_dir()-Prüfung anstandslos. Dadurch hat ein Export mit leerem
+        # Vault-Feld die Schlüsseldatei stillschweigend in den
+        # Programmordner geschrieben - bei einem Projekt auf GitHub wären
+        # die Schlüssel damit beim nächsten Hochladen öffentlich gewesen.
+        if not (vault_path or "").strip():
+            raise ValueError(
+                "Es ist noch kein Obsidian-Ordner ausgewählt.\n\n"
+                "Wähle oben über 'Durchsuchen …' deinen Vault aus.")
         self.vault_path = Path(vault_path)
         if not self.vault_path.is_dir():
             raise ValueError(f"Der Ordner '{vault_path}' existiert nicht.")

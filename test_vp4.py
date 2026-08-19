@@ -435,6 +435,28 @@ def test_obsidian():
             R.fehlschlag("Obsidian", e)
             traceback.print_exc()
 
+    # Ein leerer Vault-Pfad muss abgelehnt werden. Path("") ist in Python das
+    # aktuelle Verzeichnis und besteht is_dir() klaglos - dadurch hat ein
+    # Export mit leerem Feld die Schlüsseldatei einmal in den Programmordner
+    # geschrieben, wo sie beim nächsten Hochladen auf GitHub öffentlich
+    # geworden wäre.
+    for leer in ("", "   ", None):
+        try:
+            ObsidianSync(leer)
+            R.pruefe(f"Leerer Vault-Pfad ({leer!r}) wird abgelehnt", False,
+                     "wurde angenommen - Schlüssel landen im Programmordner!")
+        except ValueError:
+            R.pruefe(f"Leerer Vault-Pfad ({leer!r}) wird abgelehnt", True)
+        except Exception as e:
+            R.pruefe(f"Leerer Vault-Pfad ({leer!r}) wird abgelehnt", False,
+                     f"falsche Fehlerart: {type(e).__name__}: {e}")
+
+    # Im Projektordner darf keine exportierte Schlüsseldatei liegen.
+    verirrt = list(Path(__file__).resolve().parent.glob("*Schluessel*.md"))
+    R.pruefe("Keine Schlüsseldatei im Programmordner",
+             not verirrt,
+             f"gefunden: {[p.name for p in verirrt]} - gehört in den Vault, nicht hierher")
+
     # Notiz aus einer alten Programmversion: abgeschnittene Schlüssel müssen
     # gemeldet werden, statt still kaputt zurückzukommen.
     with tempfile.TemporaryDirectory() as vault:

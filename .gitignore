@@ -11,3 +11,9 @@ dist/
 # Python
 __pycache__/
 *.pyc
+
+# Exportierte Schluesseldateien - die enthalten Schluessel im KLARTEXT.
+# Zweite Sicherung: eigentlich landen die im Obsidian-Vault, aber falls
+# doch einmal eine im Projektordner auftaucht, darf sie nie ins Repo.
+VP4 Schluessel.md
+*Schluessel*.md
