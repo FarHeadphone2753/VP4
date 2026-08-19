@@ -23,10 +23,14 @@ VP4.py gebaut.
 =====================================================================
 """
 
+import base64
+import json
 import os
 import queue
+import struct
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -43,7 +47,10 @@ os.environ["VP4_TESTMODUS"] = "1"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import dateien
+import krypto
 import speicher
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from chat import ChatNetwork
 from krypto import (VERFAHREN, SCHLUESSEL_ARTEN, ClassicCiphers, ModernCrypto,
                     Pruefsummen, Signaturen)
@@ -77,6 +84,21 @@ class Ergebnis:
 
 
 R = Ergebnis()
+
+
+def _wirft_valueerror(funktion, *argumente) -> bool:
+    """Wahr, wenn der Aufruf mit einem ValueError abbricht.
+
+    Spart das immer gleiche try/except-Gerüst bei den vielen Prüfungen, die
+    nur wissen wollen: wird kaputte Eingabe sauber abgelehnt?
+    """
+    try:
+        funktion(*argumente)
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
 
 # Enthält absichtlich alles, was erfahrungsgemäß Probleme macht:
 # Umlaute, ß, Ziffern, Leer- und Sonderzeichen.
@@ -378,7 +400,365 @@ def test_schluesselspeicher():
 
 
 # ---------------------------------------------------------------------------
-#  5) Obsidian
+#  5) Formatversionen und Schlüsselableitung
+# ---------------------------------------------------------------------------
+
+# Ein Schlüsselspeicher, der mit der allerersten Fassung geschrieben wurde:
+# Marke "VP4K2", PBKDF2 mit 600.000 Runden, Parameter nirgends vermerkt.
+# Dieser Block darf NIE angepasst werden - er ist der Beweis dafür, dass ein
+# Speicher, den jemand vor einem Jahr angelegt hat, sich heute noch öffnen
+# lässt. Bricht dieser Test, hat ein Update alte Daten unbrauchbar gemacht.
+ALT_KEYSTORE_B64 = (
+    "VlA0SzL+2a7Ru1svLltoo34Quj4yMDOEaXr+2sFo7YwhI9gHc6aRR25QBC36mqD1NB9r2iUl"
+    "v3YDKgVUOKAG2AD1Q20roJ7nfXPcMs3dHue4YlCjuTWTxdbYFjSrGSo8Id6YvK/62TTtDCO8"
+    "GmAjjof2Frjrr/c7tRRJwSyUVnPfRIN3VOJ9OaqiKwtuhAvvFwIiL9O2dYbWTjrB6IZubCfF"
+    "GWfnMNgHYsiFZyqg0uwolmow7ygdVGEZsPiiPQwkFm/rFazD8XAyEbuogwt2+vV5PlbOGjHu"
+    "JrcLOArdKihTVZEElYCgdXEw"
+)
+ALT_KEYSTORE_PASSWORT = "AltesMasterPasswort2026"
+
+# Ein mit der alten Passwort-Verschlüsselung (Marke "VP4P1") erzeugter Text.
+ALT_TEXT_B64 = (
+    "VlA0UDFENE/6VQj8cw+VODkprGcL4UG6IF6mVF6LT+icDn9dnxNEzbovEDp6Xl8+C8UKRciD"
+    "AjDZ+2Zoo1DP8dobkLPVC0kaV26Orl0C5R6zyQ=="
+)
+ALT_TEXT_PASSWORT = "AltesPasswort"
+ALT_TEXT_KLAR = "Alter Text mit Umlauten: äöüß"
+
+
+def test_formatversionen():
+    print("\n=== Formatversionen und Schlüsselableitung ===")
+
+    # --- Der eigentliche Grund für diese Testgruppe -------------------------
+    # Früher stand die Rundenzahl nirgends in der Datei, sondern fest im
+    # Programm. Wer sie erhöht hätte - und irgendwann erhöht man sie -, hätte
+    # damit jeden bestehenden Schlüsselspeicher unlesbar gemacht, ohne dass
+    # irgendetwas gewarnt hätte. Deshalb muss sich ein Speicher mit
+    # ungewöhnlichen Parametern öffnen lassen: das ist der Beweis, dass die
+    # Parameter tatsächlich aus der Datei kommen und nicht aus dem Code.
+    with tempfile.TemporaryDirectory() as ordner:
+        pfad = Path(ordner) / "fremd.enc"
+        eigenwillig = {"kdf": krypto.KDF_PBKDF2, "runden": 1000}
+        inhalt = {"keys": [{"label": "X", "typ": "AES", "wert": "abc",
+                            "meta": "", "erstellt": "2026-01-01 00:00"}],
+                  "angelegt": "2026-01-01 00:00"}
+        salt = os.urandom(16)
+        kopf = ModernCrypto.kopf_bauen(KeyStore.MARKE, salt, eigenwillig)
+        abgeleitet = ModernCrypto.schluessel_ableiten(
+            "fremdes Passwort", salt, eigenwillig)
+        nonce = os.urandom(12)
+        ct = AESGCM(abgeleitet).encrypt(
+            nonce, json.dumps(inhalt).encode("utf-8"), kopf)
+        pfad.write_bytes(kopf + nonce + ct)
+
+        ks = KeyStore(pfad)
+        try:
+            ks.unlock("fremdes Passwort")
+            R.pruefe("Speicher mit anderen KDF-Parametern lässt sich öffnen",
+                     ks.list_keys()[0]["label"] == "X")
+        except Exception as e:
+            R.fehlschlag("Speicher mit anderen KDF-Parametern lässt sich öffnen", e)
+
+    # --- Alte Dateien bleiben lesbar ---------------------------------------
+    with tempfile.TemporaryDirectory() as ordner:
+        pfad = Path(ordner) / "alt.enc"
+        pfad.write_bytes(base64.b64decode(ALT_KEYSTORE_B64))
+
+        ks = KeyStore(pfad)
+        try:
+            ks.unlock(ALT_KEYSTORE_PASSWORT)
+            vorhanden = ks.list_keys()
+            R.pruefe("Alter Speicher (VP4K2) lässt sich noch öffnen",
+                     len(vorhanden) == 1 and vorhanden[0]["label"] == "Alter AES",
+                     f"gelesen: {vorhanden}")
+        except Exception as e:
+            R.fehlschlag("Alter Speicher (VP4K2) lässt sich noch öffnen", e)
+
+        # Beim nächsten Speichern soll er still auf das neue Format wechseln.
+        try:
+            ks.add_key("Neuer Schlüssel", "AES", "neu", "")
+            roh = pfad.read_bytes()
+            R.pruefe("Alter Speicher wandert beim Speichern auf VP4K3",
+                     roh.startswith(b"VP4K3"), f"Marke: {roh[:5]!r}")
+
+            frisch = KeyStore(pfad)
+            frisch.unlock(ALT_KEYSTORE_PASSWORT)
+            labels = sorted(k["label"] for k in frisch.list_keys())
+            R.pruefe("Nach dem Umzug ist alles da und das Passwort gilt weiter",
+                     labels == ["Alter AES", "Neuer Schlüssel"], f"gefunden: {labels}")
+        except Exception as e:
+            R.fehlschlag("Alter Speicher wandert beim Speichern auf VP4K3", e)
+
+    try:
+        R.pruefe("Alter Geheimtext (VP4P1) lässt sich noch entschlüsseln",
+                 ModernCrypto.password_decrypt(ALT_TEXT_B64, ALT_TEXT_PASSWORT)
+                 == ALT_TEXT_KLAR)
+    except Exception as e:
+        R.fehlschlag("Alter Geheimtext (VP4P1) lässt sich noch entschlüsseln", e)
+
+    # --- Neu Geschriebenes benutzt Argon2id --------------------------------
+    neu = ModernCrypto.password_encrypt("Hallo Welt", "geheim")
+    roh = base64.b64decode(neu)
+    R.pruefe("Neuer Geheimtext trägt die Marke VP4P2",
+             roh.startswith(b"VP4P2"), f"Marke: {roh[:5]!r}")
+    R.pruefe("Neuer Geheimtext benutzt Argon2id",
+             roh[5] == krypto.KDF_ARGON2ID, f"KDF-Kennung: {roh[5]}")
+    R.pruefe("Neuer Geheimtext lässt sich wieder entschlüsseln",
+             ModernCrypto.password_decrypt(neu, "geheim") == "Hallo Welt")
+    R.pruefe("Falsches Passwort wird auch im neuen Format abgewiesen",
+             _wirft_valueerror(ModernCrypto.password_decrypt, neu, "falsch"))
+
+    with tempfile.TemporaryDirectory() as ordner:
+        pfad = Path(ordner) / "neu.enc"
+        ks = KeyStore(pfad)
+        ks.create("MeinMasterPasswort")
+        roh = pfad.read_bytes()
+        R.pruefe("Neuer Speicher trägt die Marke VP4K3", roh.startswith(b"VP4K3"),
+                 f"Marke: {roh[:5]!r}")
+        R.pruefe("Neuer Speicher benutzt Argon2id", roh[5] == krypto.KDF_ARGON2ID)
+
+    # Die Parameter sind festgenagelt. Sie zu ändern ist erlaubt - aber dann
+    # muss man diesen Test bewusst anfassen und dabei über die Folgen
+    # nachdenken, statt sie versehentlich zu verschieben.
+    R.pruefe("Argon2id-Parameter sind die vereinbarten",
+             krypto.ARGON2_STANDARD == {"kdf": krypto.KDF_ARGON2ID, "zeit": 3,
+                                        "speicher_kib": 65536, "parallel": 1},
+             f"tatsächlich: {krypto.ARGON2_STANDARD}")
+
+    # --- Der Kopf ist mitversiegelt ----------------------------------------
+    # Die Parameter stehen offen in der Datei. Wenn jemand sie verdreht, etwa
+    # die Speichergrösse heruntersetzt, muss das auffallen - sonst liesse sich
+    # die Ableitung von aussen schwächen.
+    verbogen = bytearray(base64.b64decode(
+        ModernCrypto.password_encrypt("geheim", "pw")))
+    verbogen[10] ^= 0x01          # irgendwo in den Argon2-Parametern
+    R.pruefe("Verdrehte KDF-Parameter fallen auf",
+             _wirft_valueerror(ModernCrypto.password_decrypt,
+                               base64.b64encode(bytes(verbogen)).decode("ascii"), "pw"))
+
+    for kaputt, name in [(b"VP4P9" + b"x" * 40, "unbekannte Marke"),
+                         (b"VP4P2" + bytes([99]) + b"x" * 40, "unbekannte KDF-Kennung"),
+                         (b"VP4P2", "abgeschnittener Kopf")]:
+        R.pruefe(f"Kaputter Geheimtext wird abgelehnt ({name})",
+                 _wirft_valueerror(ModernCrypto.password_decrypt,
+                                   base64.b64encode(kaputt).decode("ascii"), "pw"))
+
+    # --- Passwortwechsel schreibt neu ab -----------------------------------
+    with tempfile.TemporaryDirectory() as ordner:
+        pfad = Path(ordner) / "wechsel.enc"
+        pfad.write_bytes(base64.b64decode(ALT_KEYSTORE_B64))
+        ks = KeyStore(pfad)
+        try:
+            ks.change_password(ALT_KEYSTORE_PASSWORT, "GanzNeuesPasswort")
+            frisch = KeyStore(pfad)
+            frisch.unlock("GanzNeuesPasswort")
+            R.pruefe("Passwortwechsel hebt einen alten Speicher auf das neue Format",
+                     pfad.read_bytes().startswith(b"VP4K3")
+                     and len(frisch.list_keys()) == 1)
+        except Exception as e:
+            R.fehlschlag("Passwortwechsel hebt einen alten Speicher auf das neue Format", e)
+
+
+# ---------------------------------------------------------------------------
+#  6) Dateien und Ordner
+# ---------------------------------------------------------------------------
+
+def _blockgrenzen(pfad):
+    """Findet die Byte-Bereiche der einzelnen Blöcke - ohne Schlüssel.
+
+    Der äussere Aufbau einer .vp4-Datei ist absichtlich auch ohne Schlüssel
+    lesbar (Längen stehen im Klartext davor). Nur so lassen sich hier
+    gezielt Blöcke verbiegen, entfernen oder vertauschen.
+    """
+    roh = pfad.read_bytes()
+    praefix = dateien.MARKE + bytes([roh[5]])
+    kopf, _, _ = ModernCrypto.kopf_lesen(roh, praefix)
+    pos = len(kopf) + 8                       # + Nonce-Basis
+    pos += 4 + struct.unpack("!I", roh[pos:pos + 4])[0]   # + Kopfsatz
+    grenzen = []
+    while pos < len(roh):
+        laenge = struct.unpack("!I", roh[pos:pos + 4])[0]
+        grenzen.append((pos, pos + 4 + laenge))
+        pos += 4 + laenge
+    return roh, grenzen
+
+
+def test_dateien():
+    print("\n=== Dateien und Ordner ===")
+
+    echte_blockgroesse = dateien.BLOCK
+    with tempfile.TemporaryDirectory() as ordner:
+        basis = Path(ordner)
+        aus = basis / "wieder"
+        aus.mkdir()
+
+        # ---------------------------------------------------- Grundfälle
+        faelle = [
+            ("Kleine Datei", b"Hallo Leon! Gruesse aus Strasse 5 - aeoeuess"),
+            ("Leere Datei", b""),
+            ("Datei ueber mehrere Bloecke", os.urandom(2_500_000)),
+        ]
+        for name, inhalt in faelle:
+            quelle = basis / f"{name}.bin"
+            quelle.write_bytes(inhalt)
+            paket = dateien.verschluesseln(quelle, dateien.zielname(quelle),
+                                           "MeinPasswort")
+            zurueck = dateien.entschluesseln(paket, aus, "MeinPasswort")
+            R.pruefe(f"{name}: kommt Byte für Byte zurück",
+                     zurueck.read_bytes() == inhalt,
+                     f"{len(zurueck.read_bytes())} statt {len(inhalt)} Byte")
+
+        # Umlaute im Namen, und der Name darf nicht im Klartext dastehen.
+        heikel = basis / "Zeugnis Halbjahr äöüß.txt"
+        heikel.write_text("streng geheim", encoding="utf-8")
+        paket = dateien.verschluesseln(heikel, dateien.zielname(heikel), "pw")
+        roh = paket.read_bytes()
+        R.pruefe("Der Dateiname steht nicht im Klartext im Container",
+                 "Zeugnis".encode("utf-8") not in roh
+                 and "Zeugnis".encode("utf-16-le") not in roh)
+        zurueck = dateien.entschluesseln(paket, aus, "pw")
+        R.pruefe("Umlaute im Dateinamen überstehen die Runde",
+                 zurueck.name == "Zeugnis Halbjahr äöüß.txt"
+                 and zurueck.read_text(encoding="utf-8") == "streng geheim",
+                 f"zurück kam: {zurueck.name}")
+
+        # ------------------------------------- Schlüssel statt Passwort
+        schluessel = ModernCrypto.generate_aes_key()
+        quelle = basis / "mit_schluessel.bin"
+        quelle.write_bytes(b"x" * 5000)
+        paket = dateien.verschluesseln(quelle, dateien.zielname(quelle),
+                                       schluessel, art=dateien.ART_SCHLUESSEL)
+        R.pruefe("Die Oberfläche erkennt, welcher Schlüssel gebraucht wird",
+                 dateien.kopf_ansehen(paket)["art"] == dateien.ART_SCHLUESSEL)
+        zurueck = dateien.entschluesseln(paket, aus, schluessel)
+        R.pruefe("Datei mit gespeichertem Schlüssel kommt zurück",
+                 zurueck.read_bytes() == b"x" * 5000)
+
+        # Zweimal derselbe Schlüssel darf nicht zweimal dasselbe ergeben -
+        # sonst wäre irgendwann ein Nonce doppelt benutzt.
+        paket2 = dateien.verschluesseln(quelle, basis / "zweitfassung.vp4",
+                                        schluessel, art=dateien.ART_SCHLUESSEL)
+        R.pruefe("Zweimal verschlüsselt ergibt zweimal etwas anderes",
+                 paket.read_bytes() != paket2.read_bytes())
+
+        # -------------------------------------------- Falscher Schlüssel
+        quelle = basis / "geheim.bin"
+        quelle.write_bytes(b"Inhalt" * 100)
+        paket = dateien.verschluesseln(quelle, dateien.zielname(quelle), "richtig")
+        R.pruefe("Falsches Passwort wird abgewiesen",
+                 _wirft_valueerror(dateien.entschluesseln, paket, aus, "falsch"))
+        R.pruefe("Eine fremde Datei wird als solche erkannt",
+                 _wirft_valueerror(dateien.entschluesseln, heikel, aus, "pw"))
+
+        # ------------------------------------------ Angriffe auf Blöcke
+        # Ab hier mit kleinen Blöcken, damit mehrere Blöcke entstehen,
+        # ohne dass der Test megabyteweise Daten schaufeln muss.
+        dateien.BLOCK = 1024
+        try:
+            quelle = basis / "mehrere_bloecke.bin"
+            inhalt = os.urandom(5000)          # ergibt fünf Blöcke
+            quelle.write_bytes(inhalt)
+            original = dateien.verschluesseln(quelle, basis / "angriff.vp4", "pw")
+            roh, grenzen = _blockgrenzen(original)
+            R.pruefe("Grosse Daten werden in mehrere Blöcke zerlegt",
+                     len(grenzen) >= 4, f"{len(grenzen)} Blöcke")
+
+            # a) Ein Bit in der Mitte kippen
+            verbogen = bytearray(roh)
+            verbogen[grenzen[1][0] + 10] ^= 0x01
+            ziel = basis / "gekippt.vp4"
+            ziel.write_bytes(bytes(verbogen))
+            R.pruefe("Ein gekipptes Bit fällt auf",
+                     _wirft_valueerror(dateien.entschluesseln, ziel, aus, "pw"))
+
+            # b) Den letzten Block abschneiden. Der Rest ist für sich
+            #    genommen unversehrt - erst das Kennzeichen "letzter Block"
+            #    verrät, dass etwas fehlt.
+            ziel = basis / "abgeschnitten.vp4"
+            ziel.write_bytes(roh[:grenzen[-1][0]])
+            R.pruefe("Ein hinten abgeschnittener Container fällt auf",
+                     _wirft_valueerror(dateien.entschluesseln, ziel, aus, "pw"))
+
+            # c) Zwei Blöcke vertauschen
+            a, b = grenzen[0], grenzen[1]
+            getauscht = (roh[:a[0]] + roh[b[0]:b[1]] + roh[a[0]:a[1]]
+                         + roh[b[1]:])
+            ziel = basis / "vertauscht.vp4"
+            ziel.write_bytes(getauscht)
+            R.pruefe("Vertauschte Blöcke fallen auf",
+                     _wirft_valueerror(dateien.entschluesseln, ziel, aus, "pw"))
+
+            # d) Einen Block in der Mitte entfernen
+            ziel = basis / "block_fehlt.vp4"
+            ziel.write_bytes(roh[:grenzen[1][0]] + roh[grenzen[1][1]:])
+            R.pruefe("Ein fehlender Block in der Mitte fällt auf",
+                     _wirft_valueerror(dateien.entschluesseln, ziel, aus, "pw"))
+        finally:
+            dateien.BLOCK = echte_blockgroesse
+
+        # ------------------------------------------------ Ganzer Ordner
+        baum = basis / "Projekt"
+        (baum / "unterordner" / "tiefer").mkdir(parents=True)
+        (baum / "notiz.txt").write_text("oben äöü", encoding="utf-8")
+        (baum / "unterordner" / "bild.bin").write_bytes(os.urandom(3000))
+        (baum / "unterordner" / "tiefer" / "leer.txt").write_text("", encoding="utf-8")
+
+        paket = dateien.verschluesseln(baum, basis / "Projekt.vp4", "ordnerpw")
+        zurueck = dateien.entschluesseln(paket, aus, "ordnerpw")
+        gefunden = sorted(p.relative_to(zurueck).as_posix()
+                          for p in zurueck.rglob("*") if p.is_file())
+        R.pruefe("Ein ganzer Ordner kommt mit allen Dateien zurück",
+                 gefunden == ["notiz.txt", "unterordner/bild.bin",
+                              "unterordner/tiefer/leer.txt"],
+                 f"gefunden: {gefunden}")
+        R.pruefe("Auch die Dateien tief im Ordner sind unverändert",
+                 (zurueck / "unterordner" / "bild.bin").read_bytes()
+                 == (baum / "unterordner" / "bild.bin").read_bytes()
+                 and (zurueck / "notiz.txt").read_text(encoding="utf-8") == "oben äöü")
+        R.pruefe("Das Zwischen-ZIP wird wieder weggeräumt",
+                 not any(p.name.endswith(".vp4zip") for p in aus.iterdir()))
+
+        # ------------------------------------ Abbruch und Fortschritt
+        quelle = basis / "gross.bin"
+        quelle.write_bytes(os.urandom(3_000_000))
+
+        stand = []
+        dateien.verschluesseln(quelle, basis / "mit_anzeige.vp4", "pw",
+                               fortschritt=lambda getan, gesamt: stand.append((getan, gesamt)))
+        R.pruefe("Der Fortschritt wird gemeldet und läuft bis zum Ende",
+                 len(stand) >= 3 and stand[-1][0] == stand[-1][1] == 3_000_000,
+                 f"letzter Stand: {stand[-1] if stand else None}")
+
+        halt = threading.Event()
+
+        def bei_fortschritt(getan, gesamt):
+            if getan > 0:
+                halt.set()
+
+        ziel = basis / "abgebrochen.vp4"
+        try:
+            dateien.verschluesseln(quelle, ziel, "pw",
+                                   fortschritt=bei_fortschritt, abbruch=halt)
+            R.pruefe("Ein Abbruch bricht wirklich ab", False, "kein Abbruch")
+        except dateien.AbgebrochenError:
+            R.pruefe("Ein Abbruch bricht wirklich ab", True)
+        R.pruefe("Nach einem Abbruch bleibt keine halbe Datei liegen",
+                 not ziel.exists()
+                 and not any(p.name.endswith(".unfertig") for p in basis.iterdir()))
+
+        # ------------------------------- Nichts wird stillschweigend überschrieben
+        quelle = basis / "doppelt.txt"
+        quelle.write_text("erste Fassung", encoding="utf-8")
+        paket = dateien.verschluesseln(quelle, basis / "doppelt.vp4", "pw")
+        erste = dateien.entschluesseln(paket, aus, "pw")
+        zweite = dateien.entschluesseln(paket, aus, "pw")
+        R.pruefe("Beim zweiten Entschlüsseln wird nichts überschrieben",
+                 erste != zweite and erste.exists() and zweite.exists(),
+                 f"{erste.name} / {zweite.name}")
+
+
+# ---------------------------------------------------------------------------
+#  7) Obsidian
 # ---------------------------------------------------------------------------
 
 def test_obsidian():
@@ -476,7 +856,7 @@ def test_obsidian():
 
 
 # ---------------------------------------------------------------------------
-#  6) Chat
+#  8) Chat
 # ---------------------------------------------------------------------------
 
 def test_chat():
@@ -570,6 +950,24 @@ def test_chat():
         b.send_text("AAAA-1111", "Noch eine Nachricht nach der Datei")
         R.pruefe("Nach einer Dateiübertragung geht das Chatten weiter",
                  warte_auf(ereignisse_a, "message") is not None)
+
+        # --- Keine stille Herabstufung auf Klartext -------------------------
+        # Wer einen gemeinsamen Schlüssel eingetragen hat, erwartet, dass
+        # auch verschlüsselt wird. Früher ging eine zu grosse Datei einfach
+        # im Klartext raus, mit einer Zeile in der Statusleiste. Damit der
+        # Test dafür keine 50 MB schaufeln muss, wird die Grenze kurz
+        # heruntergesetzt.
+        import chat as chat_mod
+        grenze_vorher = chat_mod.MAX_ENCRYPTED_FILE_SIZE
+        chat_mod.MAX_ENCRYPTED_FILE_SIZE = 1000
+        try:
+            zu_gross = Path(ordner) / "zu_gross.bin"
+            zu_gross.write_bytes(os.urandom(4000))
+            R.pruefe("Zu grosse Datei geht nicht heimlich im Klartext raus",
+                     _wirft_valueerror(b.send_file, "AAAA-1111",
+                                       str(zu_gross), "datei"))
+        finally:
+            chat_mod.MAX_ENCRYPTED_FILE_SIZE = grenze_vorher
     except Exception as e:
         R.fehlschlag("Chat", e)
         traceback.print_exc()
@@ -592,7 +990,7 @@ def test_chat():
 
 
 # ---------------------------------------------------------------------------
-#  7) Verfahrensliste
+#  9) Verfahrensliste
 # ---------------------------------------------------------------------------
 
 def test_verfahrensliste():
@@ -633,7 +1031,7 @@ def test_verfahrensliste():
 
 
 # ---------------------------------------------------------------------------
-#  8) Oberfläche
+#  10) Oberfläche
 # ---------------------------------------------------------------------------
 
 def test_oberflaeche():
@@ -696,6 +1094,60 @@ def test_oberflaeche():
             R.pruefe("Entschlüsseln über die Oberfläche gibt den Text zurück",
                      fenster.ausgabe_feld.get("1.0", "end-1c") == TESTTEXT)
 
+            # --- Die Dateiseite einmal komplett durchspielen ---------------
+            # Der Auftrag läuft in einem eigenen Thread und meldet sich über
+            # dieselbe Warteschlange wie der Chat. Der Test muss also warten
+            # und dabei die Ereignisse abarbeiten lassen - genau so, wie das
+            # Fenster es im Betrieb tut.
+            probe = Path(ordner) / "Probe äöü.txt"
+            probe.write_text(TESTTEXT, encoding="utf-8")
+
+            def auftrag_abwarten(sekunden=30):
+                ende = time.time() + sekunden
+                while fenster.auftrag_laeuft and time.time() < ende:
+                    fenster._ereignisse_abarbeiten()
+                    fenster.update()
+                    time.sleep(0.02)
+                return not fenster.auftrag_laeuft
+
+            fenster._seite_zeigen("dateien")
+            fenster._datei_uebernehmen(probe)
+            fenster.datei_geheimnis.delete(0, "end")
+            fenster.datei_geheimnis.insert(0, "DateiPasswort")
+            fenster._datei_auftrag(True)
+            fertig = auftrag_abwarten()
+            paket = probe.with_name(probe.name + ".vp4")
+            R.pruefe("Verschlüsseln über die Dateiseite erzeugt eine .vp4-Datei",
+                     fertig and paket.exists(),
+                     f"fertig={fertig}, vorhanden={paket.exists()}")
+
+            probe.unlink()
+            fenster._datei_uebernehmen(paket)
+            fenster.datei_geheimnis.delete(0, "end")
+            fenster.datei_geheimnis.insert(0, "DateiPasswort")
+            fenster._datei_auftrag(False)
+            fertig = auftrag_abwarten()
+            R.pruefe("Entschlüsseln über die Dateiseite stellt die Datei her",
+                     fertig and probe.exists()
+                     and probe.read_text(encoding="utf-8") == TESTTEXT,
+                     f"fertig={fertig}, vorhanden={probe.exists()}")
+            R.pruefe("Nach dem Auftrag ist der Abbrechen-Knopf wieder aus",
+                     str(fenster.datei_abbruch_knopf.cget("state")) == "disabled")
+
+            # --- Akzentfarben ----------------------------------------------
+            for name in gui.AKZENTE:
+                R.pruefe(f"Akzentfarbe '{name}' hat einen Namen in der Oberfläche",
+                         name in gui.AKZENT_NAMEN)
+            vorher = gui.FARBE["akzent"]
+            gui.akzent_setzen("lila")
+            R.pruefe("Die Akzentfarbe lässt sich umstellen",
+                     gui.FARBE["akzent"] != vorher
+                     and len(gui.FARBE["akzent"]) == 2)
+            gui.akzent_setzen("unbekannt")
+            R.pruefe("Eine unbekannte Farbe fällt auf Blau zurück",
+                     gui.FARBE["akzent"] == gui.AKZENTE["blau"][0])
+
+
             # Beide Designs durchschalten
             for modus in ("light", "dark"):
                 ctk.set_appearance_mode(modus)
@@ -705,6 +1157,36 @@ def test_oberflaeche():
 
             R.pruefe("Die Schlüsselliste zeigt den vorhandenen Eintrag",
                      len(fenster.schluessel_tabelle.get_children()) == 1)
+            # Ein Farbwechsel baut das Fenster neu auf - dabei darf der
+            # Schlüsselspeicher NICHT zufallen, sonst müsste man mitten im
+            # Arbeiten wieder das Master-Passwort eingeben.
+            fenster._seite_zeigen("einstellungen")
+            fenster._farbe_gewaehlt("Grün")
+            fenster._seite_zeigen("dateien")
+            fenster._farbe_gewaehlt("Grün")
+            fenster.update()
+            R.pruefe("Die gewählte Farbe steht in den Einstellungen",
+                     config.get("farbe") == "gruen", f"gespeichert: {config.get('farbe')}")
+            R.pruefe("Ein Farbwechsel färbt die Oberfläche wirklich um",
+                     gui.FARBE["akzent"] == gui.AKZENTE["gruen"][0])
+            R.pruefe("Das Fenster überlebt den Farbwechsel",
+                     bool(fenster.winfo_exists()))
+            R.pruefe("Ein Farbwechsel sperrt den Schlüsselspeicher nicht",
+                     ks.is_unlocked())
+            R.pruefe("Nach dem Farbwechsel ist dieselbe Seite offen",
+                     fenster.aktive_seite == "dateien")
+            # Genau zwei Daueraufträge, nicht bei jedem Wechsel einer mehr.
+            R.pruefe("Der Farbwechsel häuft keine Zeitgeber an",
+                     len(fenster._zeitgeber) == 2, f"offen: {fenster._zeitgeber}")
+
+            # Mehrmals hintereinander muss genauso gehen.
+            for farbe in ("Orange", "Rot", "Blau"):
+                fenster._farbe_gewaehlt(farbe)
+                fenster.update()
+            R.pruefe("Auch mehrere Farbwechsel nacheinander gehen gut",
+                     bool(fenster.winfo_exists()) and ks.is_unlocked()
+                     and len(fenster._zeitgeber) == 2
+                     and gui.FARBE["akzent"] == gui.AKZENTE["blau"][0])
     except Exception as e:
         R.fehlschlag("Oberfläche", e)
         traceback.print_exc()
@@ -730,6 +1212,8 @@ def main():
     test_moderne_verfahren()
     test_signaturen()
     test_schluesselspeicher()
+    test_formatversionen()
+    test_dateien()
     test_obsidian()
     test_chat()
     test_verfahrensliste()

@@ -34,12 +34,15 @@ import base64
 import hashlib
 import os
 import secrets
+import struct
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ed25519, padding as asym_padding
 from cryptography.exceptions import InvalidSignature
+from argon2.low_level import Type as Argon2Typ, hash_secret_raw as argon2_hash_raw
 
 
 # =============================================================================
@@ -388,11 +391,48 @@ class ClassicCiphers:
 #  Moderne, sichere Verfahren
 # =============================================================================
 
-# Wie oft das Passwort beim Ableiten durchgerechnet wird. Je höher, desto
-# länger dauert ein Durchprobieren von Passwörtern für einen Angreifer -
-# aber auch das normale Entsperren. 600.000 ist der Wert, den das OWASP
-# für PBKDF2 mit SHA-256 empfiehlt.
+# ---------------------------------------------------------------------------
+#  Schlüsselableitung: wie aus einem Passwort ein Schlüssel wird
+# ---------------------------------------------------------------------------
+#
+# Ein Passwort wie "hallo123" taugt nicht als Schlüssel - zu kurz, zu
+# vorhersehbar. Eine Ableitungsfunktion rechnet es absichtlich langsam durch
+# und macht Durchprobieren dadurch teuer.
+#
+# WICHTIG, und der Grund für den ganzen Aufbau hier: Die Einstellungen dieser
+# Rechnung stehen MIT IN DER DATEI. Früher standen sie nur im Programm. Wer
+# sie erhöht hätte - und irgendwann erhöht man sie, weil Rechner schneller
+# werden -, hätte damit jeden bestehenden Schlüsselspeicher unlesbar gemacht,
+# ohne dass irgendetwas gewarnt hätte. Steht die Einstellung in der Datei,
+# lässt sich jede alte Datei weiterhin öffnen, egal was das Programm heute
+# für richtig hält.
+
+KDF_PBKDF2 = 1        # PBKDF2 mit SHA-256 - die erste Fassung
+KDF_ARGON2ID = 2      # Argon2id - was heute aus Passwörtern gemacht wird
+KDF_HKDF = 3          # HKDF-SHA256 - wenn schon ein echter Schlüssel da ist
+
+# Wozu KDF_HKDF? Wenn der Schlüssel aus dem Schlüsselspeicher kommt, ist er
+# bereits zufällig - ihn künstlich langsam durchzurechnen brächte nichts.
+# Trotzdem soll nicht jede Datei denselben Schlüssel benutzen: HKDF mischt
+# das Salt der Datei unter, und damit bekommt jede Datei ihren eigenen.
+# Ohne das müsste man beim Nonce sehr genau aufpassen, dass sich über
+# tausend Dateien hinweg nie eines wiederholt.
+
+# Der alte Wert. 600.000 Runden waren die OWASP-Empfehlung für PBKDF2 mit
+# SHA-256. Wird nur noch zum Lesen alter Dateien gebraucht.
 PBKDF2_RUNDEN = 600_000
+
+# Argon2id ist gegenüber PBKDF2 im Vorteil, weil es nicht nur Rechenzeit,
+# sondern auch Arbeitsspeicher braucht. Genau daran scheitern Grafikkarten,
+# die sonst Tausende Passwörter gleichzeitig durchprobieren könnten.
+# 64 MiB liegen deutlich über der OWASP-Untergrenze von 19 MiB und bleiben
+# auf einem normalen Rechner trotzdem unter einer Sekunde.
+ARGON2_STANDARD = {
+    "kdf": KDF_ARGON2ID,
+    "zeit": 3,                # Durchgänge
+    "speicher_kib": 64 * 1024,
+    "parallel": 1,
+}
 
 
 class ModernCrypto:
@@ -402,17 +442,119 @@ class ModernCrypto:
 
     @staticmethod
     def derive_key(password: str, salt: bytes, runden: int = PBKDF2_RUNDEN) -> bytes:
-        """Macht aus einem Passwort einen 32 Byte langen Schlüssel.
+        """Der alte Weg: PBKDF2 mit SHA-256.
 
-        Ein Passwort wie "hallo123" ist als Schlüssel unbrauchbar - zu kurz
-        und zu vorhersehbar. PBKDF2 rechnet es sehr oft durch (siehe
-        PBKDF2_RUNDEN) und macht Durchprobieren dadurch teuer. Das Salt
-        sorgt dafür, dass gleiche Passwörter trotzdem verschiedene
-        Schlüssel ergeben.
+        Bleibt erhalten, weil Dateien aus der ersten Fassung damit
+        verschlüsselt sind. Für Neues wird schluessel_ableiten() benutzt.
         """
         kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
                          salt=salt, iterations=runden)
         return kdf.derive(password.encode("utf-8"))
+
+    @staticmethod
+    def schluessel_ableiten(password, salt: bytes, kdf: dict) -> bytes:
+        """Macht einen 32 Byte langen Schlüssel.
+
+        Welches Verfahren mit welchen Einstellungen benutzt wird, steht im
+        übergebenen kdf-Wörterbuch - und das stammt aus dem Kopf der Datei,
+        nicht aus dem Programm. Das Salt sorgt dafür, dass gleiche Passwörter
+        trotzdem verschiedene Schlüssel ergeben.
+
+        Bei KDF_PBKDF2 und KDF_ARGON2ID ist "password" ein Text, bei
+        KDF_HKDF ein bereits fertiger Schlüssel als bytes.
+        """
+        if not isinstance(salt, (bytes, bytearray)) or len(salt) != 16:
+            raise ValueError("Das Salt muss 16 Byte lang sein.")
+
+        art = kdf.get("kdf")
+        if art == KDF_HKDF:
+            if not isinstance(password, (bytes, bytearray)):
+                raise ValueError("HKDF braucht einen fertigen Schlüssel, "
+                                 "kein Passwort.")
+            return HKDF(algorithm=hashes.SHA256(), length=32, salt=bytes(salt),
+                        info=b"VP4 Datei v1").derive(bytes(password))
+        if isinstance(password, (bytes, bytearray)):
+            raise ValueError("Dieses Verfahren erwartet ein Passwort als Text.")
+        if art == KDF_PBKDF2:
+            return ModernCrypto.derive_key(password, bytes(salt), kdf["runden"])
+        if art == KDF_ARGON2ID:
+            return argon2_hash_raw(
+                secret=password.encode("utf-8"),
+                salt=bytes(salt),
+                time_cost=kdf["zeit"],
+                memory_cost=kdf["speicher_kib"],
+                parallelism=kdf["parallel"],
+                hash_len=32,
+                type=Argon2Typ.ID,
+            )
+        raise ValueError(f"Unbekanntes Ableitungsverfahren: {art}")
+
+    # ------------------------------------------------------------ Dateikopf
+    #
+    # Aufbau:
+    #     Marke          5 Byte    z.B. b"VP4P2"
+    #     KDF-Kennung    1 Byte    1 = PBKDF2, 2 = Argon2id
+    #     Einstellungen            PBKDF2:   Runden                    (4 Byte)
+    #                              Argon2id: Zeit, Speicher, Parallel  (9 Byte)
+    #     Salt          16 Byte
+    #
+    # Der fertige Kopf wird beim Verschlüsseln als "zusätzliche Daten" (AAD)
+    # an AES-GCM übergeben. Dadurch ist er mitversiegelt: Wer die Parameter
+    # verdreht - etwa die Speichergrösse heruntersetzt, um die Ableitung zu
+    # schwächen -, bekommt beim Entschlüsseln einen Fehler statt still einen
+    # falschen Schlüssel.
+
+    @staticmethod
+    def kopf_bauen(marke: bytes, salt: bytes, kdf: dict = None) -> bytes:
+        kdf = kdf or ARGON2_STANDARD
+        art = kdf.get("kdf")
+        if art == KDF_PBKDF2:
+            einstellungen = struct.pack("!I", kdf["runden"])
+        elif art == KDF_ARGON2ID:
+            einstellungen = struct.pack("!IIB", kdf["zeit"], kdf["speicher_kib"],
+                                        kdf["parallel"])
+        elif art == KDF_HKDF:
+            einstellungen = b""
+        else:
+            raise ValueError(f"Unbekanntes Ableitungsverfahren: {art}")
+        return marke + bytes([art]) + einstellungen + salt
+
+    @staticmethod
+    def kopf_lesen(roh: bytes, marke: bytes) -> tuple:
+        """Zerlegt den Kopf. Gibt (Kopf-Bytes, kdf, Salt) zurück."""
+        if not roh.startswith(marke):
+            raise ValueError("Die Daten tragen nicht die erwartete Kennzeichnung.")
+        if len(roh) < len(marke) + 1:
+            raise ValueError("Die Daten sind abgeschnitten oder beschädigt.")
+
+        art = roh[len(marke)]
+        rest = roh[len(marke) + 1:]
+        if art == KDF_PBKDF2:
+            laenge = 4
+        elif art == KDF_ARGON2ID:
+            laenge = 9
+        elif art == KDF_HKDF:
+            laenge = 0
+        else:
+            raise ValueError(
+                f"Unbekanntes Ableitungsverfahren ({art}). Vermutlich stammen "
+                "die Daten aus einer neueren Fassung des Programms.")
+
+        if len(rest) < laenge + 16:
+            raise ValueError("Die Daten sind abgeschnitten oder beschädigt.")
+
+        werte, salt = rest[:laenge], rest[laenge:laenge + 16]
+        if art == KDF_PBKDF2:
+            kdf = {"kdf": art, "runden": struct.unpack("!I", werte)[0]}
+        elif art == KDF_HKDF:
+            kdf = {"kdf": art}
+        else:
+            zeit, speicher, parallel = struct.unpack("!IIB", werte)
+            kdf = {"kdf": art, "zeit": zeit, "speicher_kib": speicher,
+                   "parallel": parallel}
+
+        kopf = roh[:len(marke) + 1 + laenge + 16]
+        return kopf, kdf, salt
 
     # ------------------------------------------------------------ AES-256
 
@@ -505,7 +647,8 @@ class ModernCrypto:
     # --------------------------------------------- Passwort-Verschlüsselung
 
     # Kennzeichnung am Anfang, damit klar ist, womit der Text erzeugt wurde.
-    PASSWORT_MARKE = b"VP4P1"
+    PASSWORT_MARKE = b"VP4P2"
+    PASSWORT_MARKE_ALT = b"VP4P1"      # erste Fassung, wird nur noch gelesen
 
     @staticmethod
     def password_encrypt(plaintext: str, password: str) -> str:
@@ -516,15 +659,19 @@ class ModernCrypto:
         genanntes Passwort reicht.
 
         Aufbau des Ergebnisses:
-          "VP4P1" + Salt (16 Byte) + Nonce (12) + verschlüsselter Text
+          Kopf (Marke + Ableitungs-Einstellungen + Salt) + Nonce (12)
+          + verschlüsselter Text
+
+        Der Kopf ist mitversiegelt, siehe kopf_bauen().
         """
         if not password:
             raise ValueError("Bitte ein Passwort angeben.")
         salt = os.urandom(16)
-        key = ModernCrypto.derive_key(password, salt)
+        kopf = ModernCrypto.kopf_bauen(ModernCrypto.PASSWORT_MARKE, salt)
+        key = ModernCrypto.schluessel_ableiten(password, salt, ARGON2_STANDARD)
         nonce = os.urandom(12)
-        ct = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
-        return base64.b64encode(ModernCrypto.PASSWORT_MARKE + salt + nonce + ct).decode("ascii")
+        ct = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), kopf)
+        return base64.b64encode(kopf + nonce + ct).decode("ascii")
 
     @staticmethod
     def password_decrypt(ciphertext_b64: str, password: str) -> str:
@@ -534,12 +681,38 @@ class ModernCrypto:
             raw = base64.b64decode((ciphertext_b64 or "").strip())
         except Exception:
             raise ValueError("Das ist kein gültiger Geheimtext.")
-        marke = ModernCrypto.PASSWORT_MARKE
-        if not raw.startswith(marke) or len(raw) < len(marke) + 16 + 12 + 1:
+
+        if raw.startswith(ModernCrypto.PASSWORT_MARKE_ALT):
+            return ModernCrypto._password_decrypt_alt(raw, password)
+
+        if not raw.startswith(ModernCrypto.PASSWORT_MARKE):
             raise ValueError("Dieser Text wurde nicht mit der Passwort-Verschlüsselung erzeugt.")
+
+        kopf, kdf, salt = ModernCrypto.kopf_lesen(raw, ModernCrypto.PASSWORT_MARKE)
+        rest = raw[len(kopf):]
+        if len(rest) < 12 + 1:
+            raise ValueError("Der Geheimtext ist zu kurz oder beschädigt.")
+        nonce, ct = rest[:12], rest[12:]
+        key = ModernCrypto.schluessel_ableiten(password, salt, kdf)
+        try:
+            pt = AESGCM(key).decrypt(nonce, ct, kopf)
+        except Exception:
+            raise ValueError("Falsches Passwort oder der Text wurde verändert.")
+        return pt.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _password_decrypt_alt(raw: bytes, password: str) -> str:
+        """Liest Geheimtext der ersten Fassung ("VP4P1").
+
+        Dort standen die Einstellungen nicht in den Daten: es war immer
+        PBKDF2 mit 600.000 Runden, und der Kopf war nicht mitversiegelt.
+        """
+        marke = ModernCrypto.PASSWORT_MARKE_ALT
+        if len(raw) < len(marke) + 16 + 12 + 1:
+            raise ValueError("Der Geheimtext ist zu kurz oder beschädigt.")
         rest = raw[len(marke):]
         salt, nonce, ct = rest[:16], rest[16:28], rest[28:]
-        key = ModernCrypto.derive_key(password, salt)
+        key = ModernCrypto.derive_key(password, salt, PBKDF2_RUNDEN)
         try:
             pt = AESGCM(key).decrypt(nonce, ct, None)
         except Exception:

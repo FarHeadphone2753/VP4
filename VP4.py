@@ -10,13 +10,15 @@ Was das Programm kann:
 
   1) Texte ver- und entschlüsseln - mit 13 Verfahren, von Caesar zum
      Ausprobieren bis AES-256 und ChaCha20 für echten Schutz
-  2) Eigene Schlüssel speichern und verwalten, geschützt durch ein
+  2) Ganze Dateien und Ordner verschlüsseln - auch sehr grosse, sie
+     wandern blockweise durch und passen nie ganz in den Speicher
+  3) Eigene Schlüssel speichern und verwalten, geschützt durch ein
      Master-Passwort
-  3) Texte signieren (beweist, dass etwas von dir kommt) und
+  4) Texte signieren (beweist, dass etwas von dir kommt) und
      Prüfsummen berechnen
-  4) Schlüssel als Notiz in einen Obsidian-Vault schreiben und von
+  5) Schlüssel als Notiz in einen Obsidian-Vault schreiben und von
      dort wieder einlesen
-  5) Im eigenen WLAN chatten und Bilder/Videos schicken - direkt
+  6) Im eigenen WLAN chatten und Bilder/Videos schicken - direkt
      zwischen den Rechnern, ohne Server und ohne Internet
 
 Alles läuft auf deinem Rechner. Es werden keine Daten ins Internet
@@ -28,6 +30,7 @@ DIE DATEIEN
   VP4.py        diese Datei - startet nur das Programm
   gui.py        die Oberfläche (CustomTkinter, mit Dark Mode)
   krypto.py     alle Ver- und Entschlüsselungsverfahren
+  dateien.py    Dateien und Ordner als .vp4-Container
   speicher.py   Schlüsselspeicher, Einstellungen, Obsidian
   chat.py       der LAN-Chat
   test_vp4.py   Selbsttest - nach Änderungen ausführen!
@@ -40,7 +43,7 @@ Unterschied, PyInstaller packt weiterhin alles in eine Datei.
 VORAUSSETZUNGEN
 ----------------
   - Python 3.9 oder neuer
-  - Einmalig installieren:   pip install cryptography customtkinter
+  - Einmalig installieren:   pip install cryptography argon2-cffi customtkinter
 
 
 EINE .EXE DARAUS MACHEN (damit Freunde kein Python brauchen)
@@ -84,7 +87,7 @@ def _abhaengigkeit_fehlt(paket: str, fehler: str):
     text = (f"Das Python-Paket '{paket}' wird gebraucht, ist aber nicht "
             f"installiert.\n\n"
             f"Bitte einmalig in einem Terminal ausführen:\n\n"
-            f"    pip install cryptography customtkinter\n\n"
+            f"    pip install cryptography argon2-cffi customtkinter\n\n"
             f"(Technischer Fehler: {fehler})")
     try:
         import tkinter as tk
@@ -107,6 +110,11 @@ def main():
         import cryptography            # noqa: F401
     except ImportError as e:
         _abhaengigkeit_fehlt("cryptography", e)
+
+    try:
+        import argon2                  # noqa: F401
+    except ImportError as e:
+        _abhaengigkeit_fehlt("argon2-cffi", e)
 
     try:
         import customtkinter           # noqa: F401

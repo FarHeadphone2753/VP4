@@ -31,6 +31,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
+import dateien
 import speicher
 from chat import ChatNetwork
 from krypto import (VERFAHREN, SCHLUESSEL_ARTEN, ClassicCiphers, ModernCrypto,
@@ -58,6 +59,34 @@ FARBE = {
     "schlecht":      ("#b91c1c", "#f87171"),
 }
 
+# Zur Auswahl stehende Akzentfarben. Der erste Wert gilt im hellen, der
+# zweite im dunklen Modus - dieselbe Ordnung wie in FARBE.
+AKZENTE = {
+    "blau":   (("#2563eb", "#3b82f6"), ("#1d4ed8", "#60a5fa")),
+    "gruen":  (("#047857", "#10b981"), ("#065f46", "#34d399")),
+    "lila":   (("#7c3aed", "#a78bfa"), ("#6d28d9", "#c4b5fd")),
+    "orange": (("#c2410c", "#fb923c"), ("#9a3412", "#fdba74")),
+    "rot":    (("#be123c", "#fb7185"), ("#9f1239", "#fda4af")),
+}
+
+# Wie die Farben in der Oberfläche heissen.
+AKZENT_NAMEN = {"blau": "Blau", "gruen": "Grün", "lila": "Lila",
+                "orange": "Orange", "rot": "Rot"}
+
+
+def akzent_setzen(name: str):
+    """Legt die Akzentfarbe fest.
+
+    Muss VOR dem Aufbau der Fenster laufen: CustomTkinter liest die Farbe
+    beim Erzeugen jedes Bedienelements einmal aus und merkt sie sich. Ein
+    Wechsel im laufenden Betrieb würde nur die Hälfte der Oberfläche
+    erwischen - deshalb greift die Einstellung erst beim nächsten Start.
+    """
+    akzent, akzent_hover = AKZENTE.get(name, AKZENTE["blau"])
+    FARBE["akzent"] = akzent
+    FARBE["akzent_hover"] = akzent_hover
+
+
 RADIUS = 10
 SCHRIFT = "Segoe UI"        # unter Windows immer vorhanden
 
@@ -65,6 +94,34 @@ SCHRIFT = "Segoe UI"        # unter Windows immer vorhanden
 def schrift(groesse=13, fett=False):
     return ctk.CTkFont(family=SCHRIFT, size=groesse,
                        weight="bold" if fett else "normal")
+
+
+def knopf(eltern, text, befehl, art="primaer", breite=150, hoehe=40, **rest):
+    """Baut einen Knopf im VP4-Stil.
+
+    Vorher stand dasselbe Rezept aus acht Angaben rund dreissig Mal
+    wortgleich im Code. Jede Farbänderung musste man dreissig Mal
+    nachziehen, und beim ersten vergessenen Mal sieht die Oberfläche
+    zusammengeflickt aus.
+
+    art:  "primaer" - gefüllt, für die Haupthandlung einer Seite
+          "zweit"   - Umriss in der Akzentfarbe
+          "leise"   - Umriss in Grau, für Nebensächliches
+    """
+    stil = {
+        "primaer": dict(fg_color=FARBE["akzent"], hover_color=FARBE["akzent_hover"],
+                        text_color="#ffffff", border_width=0,
+                        font=schrift(13, True)),
+        "zweit": dict(fg_color="transparent", hover_color=FARBE["flaeche_tief"],
+                      text_color=FARBE["akzent"], border_width=1,
+                      border_color=FARBE["akzent"], font=schrift(13, True)),
+        "leise": dict(fg_color="transparent", hover_color=FARBE["flaeche_tief"],
+                      text_color=FARBE["text_leise"], border_width=1,
+                      border_color=FARBE["rand"], font=schrift(12)),
+    }[art]
+    stil.update(rest)
+    return ctk.CTkButton(eltern, text=text, command=befehl, width=breite,
+                         height=hoehe, corner_radius=RADIUS, **stil)
 
 
 # =============================================================================
@@ -155,7 +212,7 @@ class Sperrbildschirm(ctk.CTk):
         knopf_text = "Festlegen und starten" if self.ersteinrichtung else "Entsperren"
         self.knopf = ctk.CTkButton(rahmen, text=knopf_text, width=300, height=44,
                                    corner_radius=RADIUS, font=schrift(14, True),
-                                   fg_color=FARBE["akzent"],
+                                   fg_color=FARBE["akzent"], text_color="#ffffff",
                                    hover_color=FARBE["akzent_hover"],
                                    command=self._bestaetigen)
         self.knopf.pack(pady=(4, 10))
@@ -208,9 +265,10 @@ class Sperrbildschirm(ctk.CTk):
             self.destroy()
             return
 
-        # Normales Entsperren. Das Ableiten dauert bewusst einen Moment
-        # (600.000 Runden), deshalb läuft es in einem eigenen Thread, damit
-        # das Fenster nicht einfriert.
+        # Normales Entsperren. Das Ableiten dauert bewusst einen Moment -
+        # Argon2id braucht absichtlich 64 MiB Arbeitsspeicher und mehrere
+        # Durchgänge -, deshalb läuft es in einem eigenen Thread, damit das
+        # Fenster nicht einfriert.
         self.knopf.configure(state="disabled", text="Wird geprüft …")
         self.meldung.configure(text=" ")
 
@@ -262,6 +320,7 @@ class VP4App(ctk.CTk):
 
     SEITEN = [
         ("krypto",       "🔒", "Verschlüsseln"),
+        ("dateien",      "📁", "Dateien"),
         ("schluessel",   "🔑", "Schlüssel"),
         ("signieren",    "✍",  "Signieren"),
         ("obsidian",     "📓", "Obsidian"),
@@ -283,11 +342,22 @@ class VP4App(ctk.CTk):
         self.aktiver_chat = None
         self.seiten = {}
 
+        # Für die Dateiseite: es läuft immer höchstens ein Auftrag.
+        self.auftrag_laeuft = False
+        self.auftrag_abbruch = None
+        # Wird wahr, wenn der Benutzer "Sperren" gedrückt hat. starten()
+        # baut daraufhin den Sperrbildschirm neu auf - siehe unten.
+        self.wieder_sperren = False
+        # Die laufenden Zeitgeber, damit sie beim Schliessen abbestellt
+        # werden können - siehe _spaeter() und _zeitgeber_stoppen().
+        self._zeitgeber = []
+
         self.title("Verschlüsselungs Programm 4.0")
         self.geometry("1080x720")
         self.minsize(900, 620)
         self.configure(fg_color=FARBE["flaeche_tief"])
 
+        self.aktive_seite = "krypto"
         self._bauen()
         self._seite_zeigen("krypto")
 
@@ -299,9 +369,73 @@ class VP4App(ctk.CTk):
             self.chat_status.configure(text="Chat: aus",
                                        text_color=FARBE["text_leise"])
 
+        if getattr(self.keystore, "migriert", False):
+            self.status("Der Schlüsselspeicher wurde auf das neue Format "
+                        "umgestellt (Argon2id).", "gut")
+
         self.protocol("WM_DELETE_WINDOW", self._schliessen)
-        self.after(300, self._ereignisse_pruefen)
-        self.after(1500, self._freunde_aktualisieren)
+        self._spaeter(300, self._ereignisse_pruefen)
+        self._spaeter(1500, self._freunde_aktualisieren)
+
+    def _spaeter(self, ms, funktion):
+        """Wie after(), merkt sich den Auftrag aber zum Abbestellen."""
+        kennung = self.after(ms, funktion)
+        self._zeitgeber.append(kennung)
+        return kennung
+
+    def _zeitgeber_stoppen(self):
+        """Bestellt alle wiederkehrenden Aufträge ab.
+
+        Muss vor jedem destroy() laufen. Sonst feuern sie noch einmal auf
+        ein Fenster, das es nicht mehr gibt, und Tk gibt Fehlermeldungen
+        aus - in der .exe ohne Konsole sieht die zwar niemand, aber
+        aufgeräumt ist es trotzdem nicht.
+        """
+        for kennung in self._zeitgeber:
+            try:
+                self.after_cancel(kennung)
+            except Exception:
+                pass
+        self._zeitgeber.clear()
+
+    def _oberflaeche_neu_bauen(self):
+        """Wirft den gesamten Inhalt weg und baut ihn noch einmal auf.
+
+        Nötig nach einem Farbwechsel: CustomTkinter liest die Farbe beim
+        Erzeugen jedes Bedienelements einmal aus und merkt sie sich. Im
+        Betrieb umzufärben würde nur die Hälfte der Oberfläche erwischen.
+
+        Das Fenster selbst bleibt stehen - Grösse, Position, Netzwerk,
+        Schlüsselspeicher und Chatverlauf bleiben unangetastet. Nur die
+        Bedienelemente sind danach neue Objekte.
+        """
+        vorherige_seite = self.aktive_seite
+        letzte_meldung = self.status_text.cget("text")
+
+        self._zeitgeber_stoppen()
+        for kind in self.winfo_children():
+            kind.destroy()
+        self.seiten = {}
+
+        self.configure(fg_color=FARBE["flaeche_tief"])
+        self._bauen()
+        self._seite_zeigen(vorherige_seite)
+
+        if not self.config_data.get("chat_aktiv", True):
+            self.chat_status.configure(text="Chat: aus",
+                                       text_color=FARBE["text_leise"])
+        elif self.network.server_laeuft:
+            self.chat_status.configure(text="Chat: bereit",
+                                       text_color=FARBE["gut"])
+        self.status_text.configure(text=letzte_meldung)
+
+        # Der Chatverlauf lebt im Arbeitsspeicher weiter, die Textfelder
+        # sind aber neu und leer.
+        if self.aktiver_chat:
+            self._chat_oeffnen(self.aktiver_chat)
+
+        self._spaeter(300, self._ereignisse_pruefen)
+        self._spaeter(1500, self._freunde_aktualisieren)
 
     # ------------------------------------------------------------- Aufbau
 
@@ -400,6 +534,7 @@ class VP4App(ctk.CTk):
         self.status_text.configure(text=f"[{zeit}]  {text}", text_color=farbe)
 
     def _seite_zeigen(self, name):
+        self.aktive_seite = name
         for n, seite in self.seiten.items():
             seite.grid_remove()
             self.nav_knoepfe[n].configure(fg_color="transparent",
@@ -444,7 +579,7 @@ class VP4App(ctk.CTk):
         self.verfahren_wahl = ctk.CTkOptionMenu(
             wahl, values=list(VERFAHREN), width=210, height=34,
             corner_radius=RADIUS, font=schrift(13),
-            fg_color=FARBE["akzent"], button_color=FARBE["akzent"],
+            fg_color=FARBE["akzent"], text_color="#ffffff", button_color=FARBE["akzent"],
             button_hover_color=FARBE["akzent_hover"],
             command=self._verfahren_gewechselt)
         self.verfahren_wahl.grid(row=0, column=1, sticky="w", pady=14)
@@ -478,7 +613,7 @@ class VP4App(ctk.CTk):
         knopfreihe.grid(row=1, column=1, sticky="ns", padx=(10, 0))
         self.erzeugen_knopf = ctk.CTkButton(
             knopfreihe, text="Erzeugen", width=110, height=26, corner_radius=8,
-            font=schrift(11), fg_color=FARBE["akzent"],
+            font=schrift(11), fg_color=FARBE["akzent"], text_color="#ffffff",
             hover_color=FARBE["akzent_hover"], command=self._schluessel_erzeugen)
         self.erzeugen_knopf.pack(pady=(0, 4))
         ctk.CTkButton(knopfreihe, text="Aus Speicher", width=110, height=26,
@@ -501,7 +636,7 @@ class VP4App(ctk.CTk):
         knoepfe.grid(row=5, column=0, sticky="ew", padx=26, pady=4)
         ctk.CTkButton(knoepfe, text="🔒  Verschlüsseln", height=40, width=170,
                       corner_radius=RADIUS, font=schrift(13, True),
-                      fg_color=FARBE["akzent"], hover_color=FARBE["akzent_hover"],
+                      fg_color=FARBE["akzent"], text_color="#ffffff", hover_color=FARBE["akzent_hover"],
                       command=lambda: self._rechnen(True)).pack(side="left")
         ctk.CTkButton(knoepfe, text="🔓  Entschlüsseln", height=40, width=170,
                       corner_radius=RADIUS, font=schrift(13, True),
@@ -704,6 +839,275 @@ class VP4App(ctk.CTk):
         self.clipboard_append(text)
         self.status("Ergebnis in die Zwischenablage kopiert.", "gut")
 
+    # ------------------------------------------------------ Seite: Dateien
+
+    def _seite_dateien(self, seite):
+        """Dateien und ganze Ordner verschlüsseln.
+
+        Achtung beim Ändern: jede Zeile im Raster genau einmal belegen,
+        sonst legen sich Beschriftungen über die Felder.
+        """
+        seite.grid_columnconfigure(0, weight=1)
+        seite.grid_rowconfigure(5, weight=1)
+
+        ctk.CTkLabel(seite, text="Dateien & Ordner", font=schrift(22, True),
+                     text_color=FARBE["text"], anchor="w").grid(
+                         row=0, column=0, sticky="w", padx=26, pady=(22, 2))
+
+        # --- Zeile 1: Was soll bearbeitet werden? -------------------------
+        karte = ctk.CTkFrame(seite, fg_color=FARBE["flaeche_tief"],
+                             corner_radius=RADIUS)
+        karte.grid(row=1, column=0, sticky="ew", padx=26, pady=(10, 6))
+        karte.grid_columnconfigure(0, weight=1)
+
+        self.datei_pfad = ctk.CTkLabel(
+            karte, text="Noch nichts ausgewählt.", font=schrift(13),
+            text_color=FARBE["text_leise"], anchor="w", justify="left")
+        self.datei_pfad.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+
+        auswahl = ctk.CTkFrame(karte, fg_color="transparent")
+        auswahl.grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 12))
+        knopf(auswahl, "📄  Datei wählen", self._datei_waehlen, "zweit",
+              breite=170, hoehe=36).pack(side="left", padx=4)
+        knopf(auswahl, "📁  Ordner wählen", self._ordner_waehlen, "zweit",
+              breite=170, hoehe=36).pack(side="left", padx=4)
+
+        # --- Zeile 2: Womit? ----------------------------------------------
+        schluesselkarte = ctk.CTkFrame(seite, fg_color=FARBE["flaeche_tief"],
+                                       corner_radius=RADIUS)
+        schluesselkarte.grid(row=2, column=0, sticky="ew", padx=26, pady=6)
+        schluesselkarte.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(schluesselkarte, text="Womit", font=schrift(12, True),
+                     text_color=FARBE["text_leise"]).grid(
+                         row=0, column=0, sticky="w", padx=(16, 10), pady=(14, 4))
+        self.datei_art = ctk.CTkSegmentedButton(
+            schluesselkarte, values=["Passwort", "Gespeicherter Schlüssel"],
+            font=schrift(12), command=self._datei_art_gewechselt,
+            selected_color=FARBE["akzent"], selected_hover_color=FARBE["akzent_hover"],
+            # Ohne diese drei Farben steht im hellen Modus grauer Text auf
+            # grauem Grund, und man sieht die zweite Möglichkeit kaum.
+            fg_color=FARBE["rand"], unselected_color=FARBE["flaeche"],
+            unselected_hover_color=FARBE["rand"], text_color=FARBE["text"])
+        self.datei_art.set("Passwort")
+        self.datei_art.grid(row=0, column=1, sticky="w", pady=(14, 4))
+
+        self.datei_geheimnis = ctk.CTkEntry(
+            schluesselkarte, show="•", height=38, corner_radius=RADIUS,
+            font=schrift(13), border_color=FARBE["rand"],
+            placeholder_text="Passwort")
+        self.datei_geheimnis.grid(row=1, column=0, columnspan=2, sticky="ew",
+                                  padx=16, pady=(4, 4))
+
+        self.datei_aus_speicher = knopf(
+            schluesselkarte, "Aus Speicher wählen", self._datei_schluessel_laden,
+            "leise", breite=190, hoehe=32)
+        self.datei_aus_speicher.grid(row=2, column=0, columnspan=2, sticky="w",
+                                     padx=16, pady=(0, 14))
+        self.datei_aus_speicher.grid_remove()
+
+        # --- Zeile 3: Los ------------------------------------------------
+        knoepfe = ctk.CTkFrame(seite, fg_color="transparent")
+        knoepfe.grid(row=3, column=0, sticky="ew", padx=26, pady=6)
+        knopf(knoepfe, "🔒  Verschlüsseln",
+              lambda: self._datei_auftrag(True)).pack(side="left")
+        knopf(knoepfe, "🔓  Entschlüsseln",
+              lambda: self._datei_auftrag(False), "zweit").pack(side="left", padx=8)
+        self.datei_abbruch_knopf = knopf(knoepfe, "Abbrechen",
+                                         self._datei_abbrechen, "leise", breite=110)
+        self.datei_abbruch_knopf.pack(side="left")
+        self.datei_abbruch_knopf.configure(state="disabled")
+
+        # --- Zeile 4: Wie weit? -------------------------------------------
+        fortschritt = ctk.CTkFrame(seite, fg_color="transparent")
+        fortschritt.grid(row=4, column=0, sticky="ew", padx=26, pady=(6, 2))
+        fortschritt.grid_columnconfigure(0, weight=1)
+        self.datei_balken = ctk.CTkProgressBar(fortschritt, height=10,
+                                               corner_radius=RADIUS,
+                                               progress_color=FARBE["akzent"])
+        self.datei_balken.set(0)
+        self.datei_balken.grid(row=0, column=0, sticky="ew")
+        self.datei_stand = ctk.CTkLabel(fortschritt, text="", font=schrift(11),
+                                        text_color=FARBE["text_leise"], width=150)
+        self.datei_stand.grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        # --- Zeile 5: Was ist passiert? -----------------------------------
+        self.datei_protokoll = ctk.CTkTextbox(
+            seite, corner_radius=RADIUS, font=schrift(12), border_width=1,
+            border_color=FARBE["rand"], fg_color=FARBE["flaeche_tief"])
+        self.datei_protokoll.grid(row=5, column=0, sticky="nsew", padx=26, pady=(8, 6))
+        self.datei_protokoll.insert("1.0",
+                                    "Hier steht später, was verschlüsselt wurde.\n")
+        self.datei_protokoll.configure(state="disabled")
+
+        # --- Zeile 6: Hinweis ---------------------------------------------
+        ctk.CTkLabel(
+            seite,
+            text=("Verschlüsselte Dateien enden auf .vp4. Der Dateiname steckt "
+                  "mit drin und ist von aussen nicht zu sehen. Das Original "
+                  "bleibt liegen – VP4 löscht von sich aus nichts."),
+            font=schrift(11), text_color=FARBE["text_leise"],
+            anchor="w", justify="left", wraplength=760).grid(
+                row=6, column=0, sticky="w", padx=26, pady=(0, 20))
+
+        self.datei_quelle = None
+
+    # ---------------------------------------------------- Dateiseite: Bedienung
+
+    def _datei_waehlen(self):
+        pfad = filedialog.askopenfilename(title="Datei auswählen", parent=self)
+        if pfad:
+            self._datei_uebernehmen(Path(pfad))
+
+    def _ordner_waehlen(self):
+        pfad = filedialog.askdirectory(title="Ordner auswählen", parent=self)
+        if pfad:
+            self._datei_uebernehmen(Path(pfad))
+
+    def _datei_uebernehmen(self, pfad: Path):
+        self.datei_quelle = pfad
+        if pfad.is_dir():
+            beschreibung = "Ordner"
+        else:
+            beschreibung = dateien.groesse_lesbar(pfad.stat().st_size)
+        self.datei_pfad.configure(text=f"{pfad}\n({beschreibung})",
+                                  text_color=FARBE["text"])
+
+        # Bei einer .vp4-Datei gleich einstellen, was sie überhaupt braucht -
+        # sonst probiert man mit dem falschen Feld herum.
+        if pfad.is_file() and pfad.suffix.lower() == dateien.ENDUNG:
+            try:
+                art = dateien.kopf_ansehen(pfad)["art"]
+            except ValueError:
+                return
+            gewuenscht = ("Passwort" if art == dateien.ART_PASSWORT
+                          else "Gespeicherter Schlüssel")
+            if self.datei_art.get() != gewuenscht:
+                self.datei_art.set(gewuenscht)
+                self._datei_art_gewechselt(gewuenscht)
+                self.status(f"Diese Datei braucht: {gewuenscht.lower()}.", "normal")
+
+    def _datei_art_gewechselt(self, wahl):
+        mit_passwort = wahl == "Passwort"
+        self.datei_geheimnis.configure(
+            show="•" if mit_passwort else "",
+            placeholder_text="Passwort" if mit_passwort else "Schlüssel (Base64)")
+        self.datei_geheimnis.delete(0, "end")
+        if mit_passwort:
+            self.datei_aus_speicher.grid_remove()
+        else:
+            self.datei_aus_speicher.grid()
+
+    def _datei_schluessel_laden(self):
+        eintraege = [k for k in self.keystore.list_keys()
+                     if not str(k.get("typ", "")).startswith("RSA")]
+        if not eintraege:
+            messagebox.showinfo("Leer", "Im Schlüsselspeicher ist kein passender "
+                                        "Schlüssel.", parent=self)
+            return
+        beschriftungen = [f"{k['label']}  ({k.get('typ', '?')})" for k in eintraege]
+        index = self._auswahl_abfragen("Schlüssel wählen",
+                                       "Welchen Schlüssel benutzen?", beschriftungen)
+        if index is None:
+            return
+        self.datei_geheimnis.delete(0, "end")
+        self.datei_geheimnis.insert(0, eintraege[index]["wert"])
+
+    def _datei_protokoll(self, zeile):
+        self.datei_protokoll.configure(state="normal")
+        self.datei_protokoll.insert("end", zeile + "\n")
+        self.datei_protokoll.see("end")
+        self.datei_protokoll.configure(state="disabled")
+
+    def _datei_auftrag(self, verschluesseln: bool):
+        if self.auftrag_laeuft:
+            self.status("Es läuft schon ein Auftrag.", "warn")
+            return
+        if not self.datei_quelle or not self.datei_quelle.exists():
+            messagebox.showwarning("Nichts ausgewählt",
+                                   "Bitte zuerst eine Datei oder einen Ordner "
+                                   "auswählen.", parent=self)
+            return
+        geheimnis = self.datei_geheimnis.get()
+        if not geheimnis:
+            messagebox.showwarning("Fehlt noch",
+                                   "Bitte ein Passwort beziehungsweise einen "
+                                   "Schlüssel eingeben.", parent=self)
+            return
+
+        quelle = self.datei_quelle
+        art = (dateien.ART_PASSWORT if self.datei_art.get() == "Passwort"
+               else dateien.ART_SCHLUESSEL)
+
+        if verschluesseln:
+            ziel = dateien.zielname(quelle)
+            if ziel.exists() and not messagebox.askyesno(
+                    "Schon vorhanden",
+                    f"{ziel.name} gibt es bereits. Überschreiben?", parent=self):
+                return
+
+            def arbeit(melden, abbruch):
+                return dateien.verschluesseln(quelle, ziel, geheimnis, art=art,
+                                              fortschritt=melden, abbruch=abbruch)
+            was = "Verschlüsseln"
+        else:
+            zielordner = quelle.parent
+
+            def arbeit(melden, abbruch):
+                return dateien.entschluesseln(quelle, zielordner, geheimnis,
+                                              fortschritt=melden, abbruch=abbruch)
+            was = "Entschlüsseln"
+
+        self._auftrag_starten(was, arbeit)
+
+    def _auftrag_starten(self, was, arbeit):
+        """Lässt eine langwierige Arbeit in einem eigenen Thread laufen.
+
+        Direkt im Knopfdruck ginge das nicht: die Oberfläche würde bei
+        einem grossen Ordner minutenlang einfrieren, und Abbrechen wäre
+        gar nicht erst anklickbar. Gemeldet wird über dieselbe Warteschlange
+        wie beim Chat - nur der Hauptthread fasst Widgets an.
+        """
+        self.auftrag_laeuft = True
+        self.auftrag_abbruch = threading.Event()
+        abbruch = self.auftrag_abbruch
+        self.datei_abbruch_knopf.configure(state="normal")
+        self.datei_balken.set(0)
+        self.datei_stand.configure(text="0 %")
+        self.status(f"{was} läuft …", "normal")
+
+        letzter = [-1]
+
+        def melden(getan, gesamt):
+            anteil = 1.0 if not gesamt else min(getan / gesamt, 1.0)
+            prozent = int(anteil * 100)
+            # Nicht bei jedem Block melden - sonst füllt sich die
+            # Warteschlange schneller, als die Oberfläche sie leert.
+            if prozent != letzter[0]:
+                letzter[0] = prozent
+                self.ereignisse.put(("fortschritt", (anteil, getan, gesamt)))
+
+        def lauf():
+            try:
+                ergebnis = arbeit(melden, abbruch)
+                self.ereignisse.put(("auftrag_fertig", (was, ergebnis)))
+            except dateien.AbgebrochenError:
+                self.ereignisse.put(("auftrag_abgebrochen", was))
+            except Exception as fehler:
+                self.ereignisse.put(("auftrag_fehler", (was, str(fehler))))
+
+        threading.Thread(target=lauf, daemon=True).start()
+
+    def _datei_abbrechen(self):
+        if self.auftrag_abbruch is not None:
+            self.auftrag_abbruch.set()
+            self.status("Abbruch angefordert …", "warn")
+
+    def _auftrag_beendet(self):
+        self.auftrag_laeuft = False
+        self.auftrag_abbruch = None
+        self.datei_abbruch_knopf.configure(state="disabled")
+
     # ======================================================= Seite: Schlüssel
 
     def _seite_schluessel(self, seite):
@@ -721,7 +1125,7 @@ class VP4App(ctk.CTk):
         reihe.grid(row=1, column=0, sticky="ew", padx=26, pady=10)
         ctk.CTkButton(reihe, text="+  Neuer Schlüssel", height=36, width=160,
                       corner_radius=RADIUS, font=schrift(12, True),
-                      fg_color=FARBE["akzent"], hover_color=FARBE["akzent_hover"],
+                      fg_color=FARBE["akzent"], text_color="#ffffff", hover_color=FARBE["akzent_hover"],
                       command=self._schluessel_hinzufuegen).pack(side="left")
         for text, befehl in [("Anzeigen", self._schluessel_anzeigen),
                              ("Kopieren", self._schluessel_kopieren),
@@ -844,7 +1248,7 @@ class VP4App(ctk.CTk):
             fenster.destroy()
 
         ctk.CTkButton(fenster, text="Speichern", height=38, corner_radius=RADIUS,
-                      font=schrift(13, True), fg_color=FARBE["akzent"],
+                      font=schrift(13, True), fg_color=FARBE["akzent"], text_color="#ffffff",
                       hover_color=FARBE["akzent_hover"],
                       command=sichern).pack(pady=18, padx=30, fill="x")
 
@@ -918,11 +1322,11 @@ class VP4App(ctk.CTk):
         reihe.grid(row=1, column=0, sticky="ew", padx=26, pady=10)
         ctk.CTkButton(reihe, text="Signaturschlüssel erzeugen", height=34, width=210,
                       corner_radius=RADIUS, font=schrift(12),
-                      fg_color=FARBE["akzent"], hover_color=FARBE["akzent_hover"],
+                      fg_color=FARBE["akzent"], text_color="#ffffff", hover_color=FARBE["akzent_hover"],
                       command=self._signaturschluessel_erzeugen).pack(side="left")
         self.pruefsummen_wahl = ctk.CTkOptionMenu(
             reihe, values=list(Pruefsummen.VERFAHREN), width=130, height=34,
-            corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"],
+            corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"], text_color="#ffffff",
             button_color=FARBE["akzent"], button_hover_color=FARBE["akzent_hover"])
         self.pruefsummen_wahl.pack(side="right")
         ctk.CTkLabel(reihe, text="Prüfsumme:", font=schrift(11),
@@ -959,7 +1363,7 @@ class VP4App(ctk.CTk):
         knoepfe.grid(row=8, column=0, sticky="ew", padx=26, pady=(0, 22))
         ctk.CTkButton(knoepfe, text="✍  Signieren", height=38, width=150,
                       corner_radius=RADIUS, font=schrift(12, True),
-                      fg_color=FARBE["akzent"], hover_color=FARBE["akzent_hover"],
+                      fg_color=FARBE["akzent"], text_color="#ffffff", hover_color=FARBE["akzent_hover"],
                       command=self._signieren).pack(side="left")
         ctk.CTkButton(knoepfe, text="✓  Signatur prüfen", height=38, width=170,
                       corner_radius=RADIUS, font=schrift(12), fg_color="transparent",
@@ -1057,7 +1461,7 @@ class VP4App(ctk.CTk):
         self.vault_feld.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 16))
         self.vault_feld.insert(0, self.config_data.get("obsidian_vault", ""))
         ctk.CTkButton(ordner, text="Durchsuchen …", height=36, width=140,
-                      corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"],
+                      corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"], text_color="#ffffff",
                       hover_color=FARBE["akzent_hover"],
                       command=self._vault_waehlen).grid(row=1, column=1,
                                                         padx=(0, 16), pady=(0, 16))
@@ -1066,7 +1470,7 @@ class VP4App(ctk.CTk):
         knoepfe.grid(row=2, column=0, sticky="ew", padx=26)
         ctk.CTkButton(knoepfe, text="→  Nach Obsidian exportieren", height=40, width=250,
                       corner_radius=RADIUS, font=schrift(13, True),
-                      fg_color=FARBE["akzent"], hover_color=FARBE["akzent_hover"],
+                      fg_color=FARBE["akzent"], text_color="#ffffff", hover_color=FARBE["akzent_hover"],
                       command=self._obsidian_export).pack(side="left")
         ctk.CTkButton(knoepfe, text="←  Aus Obsidian importieren", height=40, width=250,
                       corner_radius=RADIUS, font=schrift(13), fg_color="transparent",
@@ -1159,7 +1563,7 @@ class VP4App(ctk.CTk):
         knoepfe = ctk.CTkFrame(links, fg_color="transparent")
         knoepfe.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
         ctk.CTkButton(knoepfe, text="+ Freund", height=32, corner_radius=RADIUS,
-                      font=schrift(11), fg_color=FARBE["akzent"],
+                      font=schrift(11), fg_color=FARBE["akzent"], text_color="#ffffff",
                       hover_color=FARBE["akzent_hover"],
                       command=self._freund_hinzufuegen).pack(side="left", expand=True, fill="x")
         ctk.CTkButton(knoepfe, text="🔑", width=38, height=32, corner_radius=RADIUS,
@@ -1201,7 +1605,7 @@ class VP4App(ctk.CTk):
         self.chat_eingabe.bind("<Return>", lambda e: self._chat_senden())
 
         ctk.CTkButton(eingabe, text="Senden", width=90, height=40, corner_radius=RADIUS,
-                      font=schrift(12, True), fg_color=FARBE["akzent"],
+                      font=schrift(12, True), fg_color=FARBE["akzent"], text_color="#ffffff",
                       hover_color=FARBE["akzent_hover"],
                       command=self._chat_senden).grid(row=0, column=1, padx=(8, 0))
         ctk.CTkButton(eingabe, text="📎", width=44, height=40, corner_radius=RADIUS,
@@ -1249,7 +1653,7 @@ class VP4App(ctk.CTk):
                              font=schrift(11), text_color=FARBE["text_leise"],
                              justify="center").pack(pady=30)
 
-        self.after(3000, self._freunde_aktualisieren)
+        self._spaeter(3000, self._freunde_aktualisieren)
 
     def _chat_oeffnen(self, fid):
         self.aktiver_chat = fid
@@ -1341,7 +1745,7 @@ class VP4App(ctk.CTk):
                       fg_color="transparent", border_width=1,
                       border_color=FARBE["rand"], text_color=FARBE["text"]).pack(side="left", padx=5)
         ctk.CTkButton(reihe, text="Speichern", width=150, command=sichern,
-                      fg_color=FARBE["akzent"],
+                      fg_color=FARBE["akzent"], text_color="#ffffff",
                       hover_color=FARBE["akzent_hover"]).pack(side="left", padx=5)
 
         ctk.CTkLabel(fenster,
@@ -1407,7 +1811,7 @@ class VP4App(ctk.CTk):
                      text_color=FARBE["text"]).pack(side="left")
         self.design_wahl = ctk.CTkOptionMenu(
             reihe, values=["Dunkel", "Hell", "Wie das System"], width=180, height=32,
-            corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"],
+            corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"], text_color="#ffffff",
             button_color=FARBE["akzent"], button_hover_color=FARBE["akzent_hover"],
             command=self._design_gewaehlt)
         self.design_wahl.pack(side="right")
@@ -1415,10 +1819,27 @@ class VP4App(ctk.CTk):
                               "system": "Wie das System"}.get(
                                   self.config_data.get("design", "dark"), "Dunkel"))
 
+        reihe = ctk.CTkFrame(block, fg_color="transparent")
+        reihe.pack(fill="x", padx=18, pady=(0, 4))
+        ctk.CTkLabel(reihe, text="Akzentfarbe", font=schrift(12),
+                     text_color=FARBE["text"]).pack(side="left")
+        self.farb_wahl = ctk.CTkOptionMenu(
+            reihe, values=[AKZENT_NAMEN[s] for s in AKZENTE], width=180, height=32,
+            corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"], text_color="#ffffff",
+            button_color=FARBE["akzent"], button_hover_color=FARBE["akzent_hover"],
+            command=self._farbe_gewaehlt)
+        self.farb_wahl.pack(side="right")
+        self.farb_wahl.set(AKZENT_NAMEN.get(
+            self.config_data.get("farbe", "blau"), "Blau"))
+        ctk.CTkLabel(block,
+                     text="Wirkt sofort – die Oberfläche wird kurz neu gezeichnet.",
+                     font=schrift(11), text_color=FARBE["text_leise"],
+                     anchor="w").pack(anchor="w", padx=18, pady=(0, 16))
+
         # --- Sicherheit -----------------------------------------------------
         block = self._einstellungsblock(seite, 2, "Sicherheit")
         ctk.CTkButton(block, text="Master-Passwort ändern", height=36, width=220,
-                      corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"],
+                      corner_radius=RADIUS, font=schrift(12), fg_color=FARBE["akzent"], text_color="#ffffff",
                       hover_color=FARBE["akzent_hover"],
                       command=self._passwort_aendern).pack(anchor="w", padx=18, pady=(0, 16))
 
@@ -1470,6 +1891,20 @@ class VP4App(ctk.CTk):
         elif modus == "light":
             self.design_schalter.deselect()
         self._treeview_stil()
+
+    def _farbe_gewaehlt(self, wahl):
+        umgekehrt = {name: schluessel for schluessel, name in AKZENT_NAMEN.items()}
+        self.config_data["farbe"] = umgekehrt.get(wahl, "blau")
+        speicher.save_config(self.config_data)
+
+        if self.auftrag_laeuft:
+            self.status(f"Akzentfarbe: {wahl}. Sichtbar, sobald der laufende "
+                        f"Auftrag fertig ist.", "warn")
+            return
+
+        akzent_setzen(self.config_data["farbe"])
+        self._oberflaeche_neu_bauen()
+        self.status(f"Akzentfarbe: {wahl}.", "gut")
 
     def _chat_umschalten(self):
         an = bool(self.chat_schalter.get())
@@ -1568,9 +2003,33 @@ Nur zum Spielen ({len(spiel)}):  {', '.join(spiel)}
    ein Computer knackt sie in Sekunden. Nichts Wichtiges damit schützen.
 
 
+DATEIEN UND ORDNER
+
+Auf der Seite "Dateien" verschlüsselst du ganze Dateien oder komplette
+Ordner zu einer .vp4-Datei. Die Grösse spielt keine Rolle - die Daten
+wandern blockweise durch und müssen nie ganz in den Arbeitsspeicher
+passen. Ein laufender Vorgang lässt sich jederzeit abbrechen.
+
+Der Dateiname steckt mit im verschlüsselten Teil. Von aussen sieht man
+nur "Zeugnis.pdf.vp4" - also den Namen ruhig noch ändern, wenn schon
+der etwas verraten würde.
+
+Wird an einer .vp4-Datei etwas verändert, abgeschnitten oder
+umsortiert, fällt das beim Entschlüsseln auf. Du bekommst dann einen
+Fehler statt halb richtiger Daten.
+
+Das Original bleibt liegen: VP4 löscht von sich aus nichts.
+
+
 DAS MASTER-PASSWORT
 
 Dein Schlüsselspeicher ist mit deinem Master-Passwort verschlüsselt.
+Aus dem Passwort wird der Schlüssel mit Argon2id berechnet – einem
+Verfahren, das absichtlich Zeit und 64 MB Arbeitsspeicher verbraucht.
+Der Speicherbedarf ist der eigentliche Trick: Daran scheitern
+Grafikkarten, die sonst Tausende Passwörter gleichzeitig durchprobieren
+könnten.
+
 Das Passwort selbst wird nirgends gespeichert – auch nicht in
 verschlüsselter Form. Wenn du es vergisst, kommt niemand mehr an die
 gespeicherten Schlüssel heran, auch dieses Programm nicht. Es gibt
@@ -1643,7 +2102,7 @@ es nicht die einzige Absicherung sein.
         reihe = ctk.CTkFrame(fenster, fg_color="transparent")
         reihe.pack(pady=20)
         ctk.CTkButton(reihe, text="OK", width=120, height=34, corner_radius=RADIUS,
-                      fg_color=FARBE["akzent"], hover_color=FARBE["akzent_hover"],
+                      fg_color=FARBE["akzent"], text_color="#ffffff", hover_color=FARBE["akzent_hover"],
                       command=ok).pack(side="left", padx=5)
         ctk.CTkButton(reihe, text="Abbrechen", width=120, height=34,
                       corner_radius=RADIUS, fg_color="transparent", border_width=1,
@@ -1689,10 +2148,16 @@ es nicht die einzige Absicherung sein.
     # ================================================ Ereignisse vom Netzwerk
 
     def _ereignisse_pruefen(self):
-        """Holt regelmäßig ab, was die Netzwerk-Threads gemeldet haben.
+        """Arbeitet die Warteschlange ab und meldet sich gleich wieder an."""
+        self._ereignisse_abarbeiten()
+        self._spaeter(300, self._ereignisse_pruefen)
+
+    def _ereignisse_abarbeiten(self):
+        """Holt ab, was die Hintergrund-Threads gemeldet haben.
 
         Das läuft im Hauptthread - nur von hier aus darf die Oberfläche
-        angefasst werden.
+        angefasst werden. Getrennt vom Wiederanmelden, damit der Selbsttest
+        die Warteschlange sofort leeren kann, statt auf den Takt zu warten.
         """
         try:
             while True:
@@ -1718,6 +2183,37 @@ es nicht die einzige Absicherung sein.
                 elif art == "peer_update":
                     pass        # die Liste wird ohnehin regelmäßig neu gezeichnet
 
+                elif art == "fortschritt":
+                    anteil, getan, gesamt = daten
+                    self.datei_balken.set(anteil)
+                    self.datei_stand.configure(
+                        text=f"{int(anteil * 100)} %  "
+                             f"({dateien.groesse_lesbar(getan)})")
+
+                elif art == "auftrag_fertig":
+                    was, ergebnis = daten
+                    self.datei_balken.set(1)
+                    self.datei_stand.configure(text="fertig")
+                    self._datei_protokoll(f"✅ {was}: {ergebnis}")
+                    self.status(f"{was} fertig: {Path(ergebnis).name}", "gut")
+                    self._auftrag_beendet()
+
+                elif art == "auftrag_abgebrochen":
+                    self.datei_balken.set(0)
+                    self.datei_stand.configure(text="abgebrochen")
+                    self._datei_protokoll(f"⛔ {daten} abgebrochen.")
+                    self.status(f"{daten} abgebrochen.", "warn")
+                    self._auftrag_beendet()
+
+                elif art == "auftrag_fehler":
+                    was, meldung = daten
+                    self.datei_balken.set(0)
+                    self.datei_stand.configure(text="Fehler")
+                    self._datei_protokoll(f"❌ {was}: {meldung}")
+                    self.status(meldung.split(chr(10))[0], "fehler")
+                    messagebox.showerror(was, meldung, parent=self)
+                    self._auftrag_beendet()
+
                 elif art == "server_bereit":
                     self.chat_status.configure(text=f"Chat: bereit (Port {daten})",
                                                text_color=FARBE["gut"])
@@ -1739,11 +2235,6 @@ es nicht die einzige Absicherung sein.
         except queue.Empty:
             pass
 
-        if self.config_data.get("chat_aktiv", True) and not self.network.server_laeuft:
-            if self.chat_status.cget("text") == "Chat: startet …":
-                pass
-        self.after(300, self._ereignisse_pruefen)
-
     # ==================================================== Sperren / Schließen
 
     def _sperren(self):
@@ -1752,14 +2243,24 @@ es nicht die einzige Absicherung sein.
                                    "VP4 sperren? Du musst dann dein Master-Passwort "
                                    "wieder eingeben.", parent=self):
             return
+        if self.auftrag_laeuft:
+            self.status("Erst den laufenden Auftrag abwarten oder abbrechen.",
+                        "warn")
+            return
         self.keystore.lock()
         self.network.stop()
+        # Nur merken und schliessen. Früher rief diese Stelle starten() auf,
+        # und weil starten() wieder ein mainloop() startet, stapelte jedes
+        # Sperren eine weitere Fensterschleife auf den Stapel - nach ein
+        # paar Runden war das ein Turm, der nie wieder abgebaut wurde.
+        self._zeitgeber_stoppen()
+        self.wieder_sperren = True
         self.destroy()
-        starten()       # von vorn, mit Sperrbildschirm
 
     def _schliessen(self):
         self.network.stop()
         self.keystore.lock()
+        self._zeitgeber_stoppen()
         self.destroy()
 
 
@@ -1772,17 +2273,27 @@ def starten():
     speicher.ordner_anlegen()
     config = speicher.load_config()
 
+    # Muss vor dem ersten Fenster stehen, siehe akzent_setzen().
+    akzent_setzen(config.get("farbe", "blau"))
     ctk.set_appearance_mode(config.get("design", "dark"))
     ctk.set_default_color_theme("blue")
 
     keystore = KeyStore(speicher.KEYSTORE_FILE)
+
+    while True:
+        if not _eine_sitzung(keystore, config):
+            return
+
+
+def _eine_sitzung(keystore, config) -> bool:
+    """Sperrbildschirm und danach das Hauptfenster. Wahr = wieder sperren."""
     ersteinrichtung = not keystore.exists()
 
     sperre = Sperrbildschirm(keystore, ersteinrichtung)
     sperre.mainloop()
 
     if not sperre.erfolgreich:
-        return
+        return False
 
     if ersteinrichtung:
         config["master_passwort_gesetzt"] = True
@@ -1790,3 +2301,4 @@ def starten():
 
     app = VP4App(keystore, config)
     app.mainloop()
+    return app.wieder_sperren

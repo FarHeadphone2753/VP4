@@ -38,7 +38,8 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from krypto import ModernCrypto, PBKDF2_RUNDEN
+from krypto import (ARGON2_STANDARD, KDF_PBKDF2, PBKDF2_RUNDEN,
+                    ModernCrypto)
 
 
 # =============================================================================
@@ -106,7 +107,6 @@ STANDARD_EINSTELLUNGEN = {
     "farbe": "blau",               # Akzentfarbe der Oberfläche
     "master_passwort_gesetzt": False,
     "chat_aktiv": True,
-    "beim_start_sperren": True,
 }
 
 
@@ -163,20 +163,33 @@ class KeyStore:
     """Der mit dem Master-Passwort verschlüsselte Schlüsselspeicher.
 
     Dateiaufbau:
-        "VP4K2" | Salt (16 Byte) | Nonce (12 Byte) | verschlüsselter Inhalt
+        Kopf | Nonce (12 Byte) | verschlüsselter Inhalt
 
-    Verschlüsselt wird mit AES-256-GCM. GCM merkt selbst, wenn an der Datei
-    etwas verändert wurde - beim Entsperren fällt das dann auf, statt still
-    Unsinn zurückzugeben.
+    Der Kopf enthält die Marke "VP4K3", die Einstellungen der
+    Schlüsselableitung und das Salt - Aufbau und Begründung stehen bei
+    ModernCrypto.kopf_bauen(). Verschlüsselt wird mit AES-256-GCM, und der
+    Kopf geht als zusätzliche Daten mit ein. GCM merkt dadurch selbst, wenn
+    an der Datei etwas verändert wurde - beim Entsperren fällt das auf, statt
+    still Unsinn zurückzugeben.
+
+    Die erste Fassung trug die Marke "VP4K2" und hatte die Einstellungen
+    nirgends vermerkt (immer PBKDF2 mit 600.000 Runden). Solche Dateien
+    werden weiterhin gelesen und beim Entsperren still auf das neue Format
+    gehoben.
     """
 
-    MARKE = b"VP4K2"
+    MARKE = b"VP4K3"
+    MARKE_ALT = b"VP4K2"
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self._data = None
         self._key = None
         self._salt = None
+        self._kdf = None
+        # Wird wahr, wenn beim Entsperren eine alte Datei umgestellt wurde.
+        # Die Oberfläche kann das in der Statusleiste erwähnen.
+        self.migriert = False
 
     # ------------------------------------------------------------- Zustand
 
@@ -197,7 +210,9 @@ class KeyStore:
         if not master_password:
             raise ValueError("Bitte ein Master-Passwort angeben.")
         self._salt = os.urandom(16)
-        self._key = ModernCrypto.derive_key(master_password, self._salt)
+        self._kdf = dict(ARGON2_STANDARD)
+        self._key = ModernCrypto.schluessel_ableiten(
+            master_password, self._salt, self._kdf)
         self._data = {"keys": [], "angelegt": datetime.now().strftime("%Y-%m-%d %H:%M")}
         self._save()
 
@@ -206,15 +221,49 @@ class KeyStore:
         if not self.exists():
             raise FileNotFoundError("Es gibt noch keinen Schlüsselspeicher.")
         roh = self.path.read_bytes()
-        if not roh.startswith(self.MARKE):
+
+        if roh.startswith(self.MARKE_ALT):
+            self._unlock_alt(roh, master_password)
+        elif roh.startswith(self.MARKE):
+            self._unlock_neu(roh, master_password)
+        else:
             raise ValueError("Die Datei ist kein VP4-Schlüsselspeicher.")
-        rest = roh[len(self.MARKE):]
+
+        # Solange wir das Passwort noch in der Hand haben: eine Datei mit
+        # veralteter Ableitung gleich auf den heutigen Stand heben. Später
+        # ginge das nicht mehr, denn dafür muss der Schlüssel neu aus dem
+        # Passwort berechnet werden.
+        if self._kdf != ARGON2_STANDARD:
+            self._auf_aktuellen_stand_heben(master_password)
+
+    def _unlock_neu(self, roh: bytes, master_password: str):
+        kopf, kdf, salt = ModernCrypto.kopf_lesen(roh, self.MARKE)
+        rest = roh[len(kopf):]
+        if len(rest) < 12 + 1:
+            raise ValueError("Der Schlüsselspeicher ist beschädigt.")
+        nonce, ct = rest[:12], rest[12:]
+        key = ModernCrypto.schluessel_ableiten(master_password, salt, kdf)
+        self._entschluesseln(key, nonce, ct, kopf)
+        self._salt, self._kdf = salt, kdf
+
+    def _unlock_alt(self, roh: bytes, master_password: str):
+        """Liest einen Speicher der ersten Fassung ("VP4K2").
+
+        Dort stand die Ableitung nicht in der Datei: es war immer PBKDF2 mit
+        600.000 Runden, und der Kopf war nicht mitversiegelt.
+        """
+        rest = roh[len(self.MARKE_ALT):]
         if len(rest) < 16 + 12 + 1:
             raise ValueError("Der Schlüsselspeicher ist beschädigt.")
         salt, nonce, ct = rest[:16], rest[16:28], rest[28:]
         key = ModernCrypto.derive_key(master_password, salt)
+        self._entschluesseln(key, nonce, ct, None)
+        self._salt = salt
+        self._kdf = {"kdf": KDF_PBKDF2, "runden": PBKDF2_RUNDEN}
+
+    def _entschluesseln(self, key: bytes, nonce: bytes, ct: bytes, aad):
         try:
-            klar = AESGCM(key).decrypt(nonce, ct, None)
+            klar = AESGCM(key).decrypt(nonce, ct, aad)
         except Exception:
             # Hier landet man sowohl bei falschem Passwort als auch bei einer
             # veränderten Datei. Unterscheiden lässt sich das nicht - und man
@@ -223,12 +272,29 @@ class KeyStore:
             raise FalschesPasswortError("Falsches Master-Passwort.")
         self._data = json.loads(klar.decode("utf-8"))
         self._key = key
-        self._salt = salt
+
+    def _auf_aktuellen_stand_heben(self, master_password: str):
+        """Schreibt den Speicher mit der heutigen Ableitung neu."""
+        alter_schluessel, altes_salt, altes_kdf = self._key, self._salt, self._kdf
+        self._salt = os.urandom(16)
+        self._kdf = dict(ARGON2_STANDARD)
+        self._key = ModernCrypto.schluessel_ableiten(
+            master_password, self._salt, self._kdf)
+        try:
+            self._save()
+            self.migriert = True
+        except OSError:
+            # Zum Beispiel ein schreibgeschützter Ordner. Kein Grund, das
+            # Entsperren scheitern zu lassen - die Schlüssel sind ja da.
+            # Beim nächsten Speichern wird es erneut versucht.
+            self._key, self._salt, self._kdf = alter_schluessel, altes_salt, altes_kdf
 
     def lock(self):
         self._data = None
         self._key = None
         self._salt = None
+        self._kdf = None
+        self.migriert = False
 
     def change_password(self, altes: str, neues: str):
         """Ändert das Master-Passwort. Der Inhalt bleibt erhalten."""
@@ -237,16 +303,18 @@ class KeyStore:
         if not neues:
             raise ValueError("Bitte ein neues Master-Passwort angeben.")
         self._salt = os.urandom(16)
-        self._key = ModernCrypto.derive_key(neues, self._salt)
+        self._kdf = dict(ARGON2_STANDARD)
+        self._key = ModernCrypto.schluessel_ableiten(neues, self._salt, self._kdf)
         self._save()
 
     def _save(self):
         ordner_anlegen()
         klar = json.dumps(self._data, ensure_ascii=False).encode("utf-8")
+        kopf = ModernCrypto.kopf_bauen(self.MARKE, self._salt, self._kdf)
         nonce = os.urandom(12)
-        ct = AESGCM(self._key).encrypt(nonce, klar, None)
+        ct = AESGCM(self._key).encrypt(nonce, klar, kopf)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_bytes(self.MARKE + self._salt + nonce + ct)
+        tmp.write_bytes(kopf + nonce + ct)
         tmp.replace(self.path)
 
     # --------------------------------------------------- Schlüssel verwalten

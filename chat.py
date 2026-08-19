@@ -430,7 +430,22 @@ class ChatNetwork:
         name = os.path.basename(filepath)
         freund = self.friends.get(friend_id) or {}
         will_verschluesseln = bool(freund.get("shared_key_b64"))
-        kann_verschluesseln = will_verschluesseln and groesse <= MAX_ENCRYPTED_FILE_SIZE
+
+        # Früher wurde eine zu grosse Datei einfach im Klartext geschickt und
+        # nur eine Zeile in die Statusleiste geschrieben. Wer einen
+        # gemeinsamen Schlüssel eingetragen hat, erwartet aber, dass auch
+        # verschlüsselt wird - eine Sicherheitszusage still zu unterlaufen
+        # ist schlimmer, als die Übertragung abzulehnen.
+        if will_verschluesseln and groesse > MAX_ENCRYPTED_FILE_SIZE:
+            raise ValueError(
+                f"'{name}' ist {groesse / 1024 / 1024:.0f} MB gross. "
+                f"Verschlüsselt gehen zurzeit höchstens "
+                f"{MAX_ENCRYPTED_FILE_SIZE // 1024 // 1024} MB, und "
+                f"unverschlüsselt wird sie nicht heimlich verschickt. "
+                f"Verschlüssele sie auf der Seite 'Dateien' und schicke "
+                f"dann die .vp4-Datei.")
+
+        kann_verschluesseln = will_verschluesseln
 
         meta = {"kind": kind, "name": name, "size": groesse}
         meta_verschluesselt, meta_payload = self._maybe_encrypt(
@@ -444,9 +459,6 @@ class ChatNetwork:
             self._send_frame(sock, MSG_DATA, ModernCrypto.aes_encrypt_bytes(roh, key),
                              encrypted=True)
         else:
-            if will_verschluesseln and groesse > MAX_ENCRYPTED_FILE_SIZE:
-                self.events.put(("info",
-                    f"'{name}' ist größer als 50 MB und wurde unverschlüsselt gesendet."))
             sock.sendall(struct.pack("!BBI", 0, MSG_DATA, groesse))
             with open(filepath, "rb") as f:
                 while True:

@@ -27,6 +27,7 @@ nicht einmal warum.
 
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -43,6 +44,7 @@ def schritt_pakete():
     melde("Schritt 1/5: Pakete prüfen")
     fehlt = []
     for paket, zweck in [("cryptography", "Verschlüsselung"),
+                         ("argon2", "Ableitung des Master-Schlüssels"),
                          ("customtkinter", "Oberfläche"),
                          ("PIL", "Icon"),
                          ("PyInstaller", "Bauen der .exe")]:
@@ -53,7 +55,8 @@ def schritt_pakete():
             fehlt.append(paket)
             print(f"    [FEHLT] {paket}  ({zweck})")
     if fehlt:
-        namen = {"PIL": "pillow", "PyInstaller": "pyinstaller"}
+        namen = {"PIL": "pillow", "PyInstaller": "pyinstaller",
+                 "argon2": "argon2-cffi"}
         print("\nBitte zuerst installieren:")
         print("    pip install " + " ".join(namen.get(p, p) for p in fehlt))
         return False
@@ -101,6 +104,12 @@ def schritt_bauen(icon):
         # Ohne das fehlen CustomTkinter die Design-Dateien und die .exe
         # stürzt beim Start ab, ohne zu sagen warum.
         "--collect-all", "customtkinter",
+        # argon2-cffi bringt eine kompilierte Bibliothek mit, die PyInstaller
+        # nicht von allein findet. Ohne die Zeile baut die .exe fehlerfrei
+        # und scheitert erst beim Entsperren - also genau dann, wenn man es
+        # am wenigsten gebrauchen kann.
+        "--collect-all", "argon2",
+        "--hidden-import", "_argon2_cffi_bindings",
     ]
     if icon:
         befehl += ["--icon", str(icon)]
@@ -129,7 +138,16 @@ def schritt_probelauf(exe):
     # Die .exe kurz starten und schauen, ob sie am Leben bleibt. Startet sie
     # gar nicht, ist sie sofort wieder weg - genau das passiert z.B., wenn
     # CustomTkinter seine Design-Dateien nicht findet.
-    lauf = subprocess.Popen([str(exe)], cwd=exe.parent)
+    # In einem Wegwerf-Ordner, nicht in dist/. VP4 legt seinen Datenordner
+    # immer NEBEN die .exe - der Probelauf würde sonst ein leeres
+    # vp4_daten mit eigener Chat-ID in dist/ hinterlassen, das man beim
+    # Verschicken versehentlich mitgibt. Nebenbei ist das der ehrlichere
+    # Test: genau so kommt die Datei bei einem Freund an, ohne alles.
+    wegwerf = Path(tempfile.mkdtemp(prefix="vp4_probelauf_"))
+    probe_exe = wegwerf / exe.name
+    shutil.copy2(exe, probe_exe)
+
+    lauf = subprocess.Popen([str(probe_exe)], cwd=wegwerf)
     time.sleep(9)
     laeuft = lauf.poll() is None
     if laeuft:
@@ -139,7 +157,9 @@ def schritt_probelauf(exe):
             lauf.wait(timeout=5)
         except subprocess.TimeoutExpired:
             lauf.kill()
+        shutil.rmtree(wegwerf, ignore_errors=True)
     else:
+        shutil.rmtree(wegwerf, ignore_errors=True)
         print(f"    [FEHLER] Die .exe hat sich sofort beendet "
               f"(Rückgabewert {lauf.returncode}).")
         print("    Zum Nachsehen einmal ohne --noconsole bauen, dann wird der")

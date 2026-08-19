@@ -35,7 +35,8 @@ den Abschnitt weiter unten – es gibt keine Wiederherstellung.
 ### Verschlüsseln und Entschlüsseln
 
 13 Verfahren, und bei jedem steht dabei, ob es wirklich sicher ist oder nur zum
-Herumprobieren taugt.
+Herumprobieren taugt. Für Dateien und Ordner gibt es eine eigene Seite,
+siehe unten.
 
 **Sicher – dafür geeignet, etwas zu schützen:**
 
@@ -52,6 +53,26 @@ Caesar · Vigenère · Playfair · Rail-Fence · ROT13 · Atbash · Morse · XOR
 
 Diese Verfahren sind Jahrhunderte alt und interessant zum Ausprobieren – aber
 schütze damit nichts, was wirklich geheim bleiben soll.
+
+### Dateien und ganze Ordner
+
+Nicht nur Text: VP4 verschlüsselt auch **Dateien und komplette Ordner** zu
+einer `.vp4`-Datei. Das läuft im Hintergrund mit Fortschrittsbalken und
+Abbrechen-Knopf, und die Grösse spielt keine Rolle – die Daten wandern
+blockweise durch und müssen nie ganz in den Arbeitsspeicher passen.
+
+Der **Dateiname steckt mit im verschlüsselten Teil**. Von aussen ist an
+`Zeugnis.pdf.vp4` also nicht abzulesen, was drin war – man sieht nur eine
+Datei namens `Zeugnis.pdf.vp4`, deshalb den Namen ruhig noch ändern.
+
+Wird an einer verschlüsselten Datei auch nur ein Bit verändert, ein Stück
+abgeschnitten oder etwas umsortiert, merkt VP4 das beim Entschlüsseln und
+gibt lieber einen Fehler aus, als halb richtige Daten.
+
+⚠️ Das Original bleibt liegen. **VP4 löscht von sich aus nichts** – wenn du
+es weghaben willst, musst du es selbst löschen. (Und ehrlich gesagt: auf
+einer SSD bekommt man Daten mit normalem Löschen ohnehin nicht sicher weg,
+egal was Programme mit „Schreddern" im Namen versprechen.)
 
 ### Schlüsselspeicher
 
@@ -84,6 +105,10 @@ Für verschlüsselte Nachrichten tragt ihr **beide denselben gemeinsamen
 Schlüssel** ein (🔑 in der Freundesliste). Ohne das gehen die Nachrichten
 unverschlüsselt durchs WLAN.
 
+Über den Chat gehen zurzeit höchstens 50 MB verschlüsselt. Ist eine Datei
+grösser, **schickt VP4 sie nicht heimlich im Klartext**, sondern sagt es dir:
+verschlüssele sie dann auf der Seite *Dateien* und schicke die `.vp4`.
+
 **Der Chat funktioniert nur im selben WLAN.** Über das Internet geht es nicht –
 dafür bräuchte es einen Server, den es (noch) nicht gibt.
 
@@ -96,7 +121,10 @@ Schlüsselspeicher verschlüsselt.
 
 **Das Passwort wird nirgends gespeichert.** Nicht im Klartext, nicht
 verschlüsselt, nirgends. Aus ihm wird nur der Schlüssel berechnet, mit dem die
-Datei ver- und entschlüsselt wird.
+Datei ver- und entschlüsselt wird – mit **Argon2id**, einem Verfahren, das
+absichtlich Zeit *und* 64 MB Arbeitsspeicher verbraucht. Der Speicherbedarf ist
+der eigentliche Trick: Daran scheitern Grafikkarten, die sonst Tausende
+Passwörter gleichzeitig durchprobieren könnten.
 
 Das bedeutet: **Wenn du es vergisst, kommst du nie wieder an deine gespeicherten
 Schlüssel.** Niemand kann das rückgängig machen – auch dieses Programm nicht.
@@ -125,10 +153,10 @@ Wiederherstellungsmöglichkeit wäre auch ein Weg für jemand anderen.
 Du brauchst Python 3.9 oder neuer.
 
 ```bash
-pip install cryptography customtkinter pillow pyinstaller
+pip install cryptography argon2-cffi customtkinter pillow pyinstaller
 
 python VP4.py        # direkt starten
-python test_vp4.py   # Selbsttest (90 Prüfungen)
+python test_vp4.py   # Selbsttest (151 Prüfungen)
 python bauen.py      # eigene VP4.exe erzeugen -> dist/VP4.exe
 ```
 
@@ -139,6 +167,7 @@ python bauen.py      # eigene VP4.exe erzeugen -> dist/VP4.exe
 | `VP4.py` | Einstiegspunkt |
 | `gui.py` | Oberfläche (CustomTkinter, Dark Mode) |
 | `krypto.py` | Alle Verfahren, Signaturen, Prüfsummen |
+| `dateien.py` | Dateien und Ordner als `.vp4`-Container |
 | `speicher.py` | Schlüsselspeicher, Einstellungen, Obsidian |
 | `chat.py` | LAN-Chat |
 | `test_vp4.py` | Selbsttest |
