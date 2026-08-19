@@ -195,14 +195,20 @@ class ClassicCiphers:
 
     @staticmethod
     def vigenere(text: str, key: str, decrypt: bool) -> str:
-        key = "".join(ch for ch in (key or "") if ch.isalpha())
+        # Nur A-Z/a-z. Umlaute (ä/ö/ü/ß) und andere Sonderzeichen haben im
+        # 26-Buchstaben-Alphabet keinen Platz und bleiben deshalb - genau wie
+        # bei Caesar - unverändert stehen. Wichtig: ch.isalpha() wäre hier
+        # falsch, denn Python zählt auch "ä" als Buchstabe. Die Rechnung
+        # darunter ist aber reines ASCII, wodurch Umlaute unwiederbringlich
+        # in den a-z-Bereich gequetscht würden (aus "äöüß" wurde "btzw").
+        key = "".join(ch for ch in (key or "") if "a" <= ch <= "z" or "A" <= ch <= "Z")
         if not key:
-            raise ValueError("Bitte ein Schlüsselwort (nur Buchstaben) angeben.")
+            raise ValueError("Bitte ein Schlüsselwort angeben (nur die Buchstaben A-Z).")
         key_upper = key.upper()
         out = []
         ki = 0
         for ch in text:
-            if ch.isalpha():
+            if "a" <= ch <= "z" or "A" <= ch <= "Z":
                 shift = ord(key_upper[ki % len(key_upper)]) - 65
                 if decrypt:
                     shift = -shift
