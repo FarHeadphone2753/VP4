@@ -34,6 +34,13 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# MUSS vor dem Import von speicher/gui stehen: verhindert, dass ein Testlauf
+# die echten Einstellungen überschreibt. Ohne das hat ein Testlauf schon
+# einmal den eingestellten Obsidian-Ordner gelöscht, weil der Test das
+# Hauptfenster mit erfundenen Standardwerten aufbaut und die dann gespeichert
+# wurden.
+os.environ["VP4_TESTMODUS"] = "1"
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import speicher
@@ -357,6 +364,17 @@ def test_schluesselspeicher():
     stufen = [passwort_staerke(p)[0] for p in ["a", "abcdefgh", "Abcdefgh1!ngLang"]]
     R.pruefe("Passwortstärke steigt mit Länge und Vielfalt",
              stufen[0] < stufen[-1], f"Stufen: {stufen}")
+
+    # Ein Testlauf darf die echten Einstellungen niemals verändern. Das ist
+    # schon einmal schiefgegangen: der Test baut das Hauptfenster mit
+    # erfundenen Standardwerten auf, die wurden gespeichert, und der
+    # tatsächlich eingestellte Obsidian-Ordner war weg.
+    vorher = speicher.CONFIG_FILE.read_bytes() if speicher.CONFIG_FILE.exists() else None
+    speicher.save_config({"my_id": "KAPUTT", "obsidian_vault": "weg"})
+    nachher = speicher.CONFIG_FILE.read_bytes() if speicher.CONFIG_FILE.exists() else None
+    R.pruefe("Ein Testlauf fasst die echten Einstellungen nicht an",
+             vorher == nachher,
+             "save_config hat trotz VP4_TESTMODUS geschrieben!")
 
 
 # ---------------------------------------------------------------------------

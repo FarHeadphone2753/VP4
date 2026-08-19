@@ -131,6 +131,19 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
+    """Schreibt die Einstellungen.
+
+    Der Testmodus ist eine Sicherung gegen einen Fehler, der einmal echten
+    Schaden angerichtet hat: Tests und Vorschau-Läufe bauen das Hauptfenster
+    mit erfundenen Standardeinstellungen auf. Sobald darin etwas gespeichert
+    wurde, landete das in der echten konfig.json - und überschrieb den
+    tatsächlich eingestellten Obsidian-Ordner mit einem leeren Wert.
+
+    Wer das Fenster zum Testen baut, setzt VP4_TESTMODUS. Dann wird nichts
+    geschrieben, egal was im Programm passiert.
+    """
+    if os.environ.get("VP4_TESTMODUS"):
+        return
     save_json(CONFIG_FILE, cfg)
 
 

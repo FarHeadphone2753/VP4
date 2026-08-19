@@ -85,7 +85,10 @@ class Sperrbildschirm(ctk.CTk):
         self.erfolgreich = False
 
         self.title("VP4")
-        self.geometry("460x560")
+        # Beim ersten Start ist mehr unterzubringen: zweites Eingabefeld,
+        # Stärkeanzeige und der Hinweiskasten. Mit einer festen Höhe für
+        # beide Fälle wurde der Knopf ganz unten abgeschnitten.
+        self.geometry("470x700" if ersteinrichtung else "470x520")
         self.resizable(False, False)
         self.configure(fg_color=FARBE["flaeche_tief"])
 
@@ -141,9 +144,9 @@ class Sperrbildschirm(ctk.CTk):
             )
             kasten = ctk.CTkFrame(rahmen, fg_color=FARBE["flaeche_tief"],
                                   corner_radius=RADIUS)
-            kasten.pack(fill="x", padx=28, pady=(16, 8))
+            kasten.pack(fill="x", padx=26, pady=(14, 6))
             ctk.CTkLabel(kasten, text=warnung, font=schrift(11), justify="left",
-                         wraplength=250, text_color=FARBE["warn"]).pack(padx=14, pady=12)
+                         wraplength=330, text_color=FARBE["warn"]).pack(padx=14, pady=12)
 
         self.meldung = ctk.CTkLabel(rahmen, text=" ", font=schrift(12),
                                     text_color=FARBE["schlecht"], wraplength=300)
@@ -290,6 +293,11 @@ class VP4App(ctk.CTk):
 
         if self.config_data.get("chat_aktiv", True):
             self.network.start()
+        else:
+            # Sonst bliebe unten "Chat: startet …" stehen und man wartet auf
+            # etwas, das gar nicht kommt.
+            self.chat_status.configure(text="Chat: aus",
+                                       text_color=FARBE["text_leise"])
 
         self.protocol("WM_DELETE_WINDOW", self._schliessen)
         self.after(300, self._ereignisse_pruefen)
