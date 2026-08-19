@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+=====================================================================
+ bauen.py - macht aus dem Projekt eine fertige VP4.exe
+=====================================================================
+    python bauen.py
+
+Danach liegt die fertige Datei unter  dist/VP4.exe  und kann verschickt
+oder bei GitHub hochgeladen werden. Deine Freunde brauchen dafür weder
+Python noch sonst etwas installiert zu haben - Doppelklick genügt.
+
+Was das Skript macht:
+  1. prüft, ob alle nötigen Pakete da sind
+  2. lässt den Selbsttest laufen (bei Fehlern wird nicht gebaut)
+  3. erzeugt das Icon neu
+  4. baut die .exe
+  5. prüft, dass die entstandene Datei auch wirklich startet
+
+Warum ein Skript und kein einzelner Befehl: CustomTkinter bringt
+Design-Dateien mit, die PyInstaller von allein nicht findet. Ohne
+--collect-all customtkinter baut die .exe zwar fehlerfrei, stürzt beim
+Doppelklick aber sofort ab - und weil sie ohne Konsole läuft, sieht man
+nicht einmal warum.
+=====================================================================
+"""
+
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ORDNER = Path(__file__).resolve().parent
+NAME = "VP4"
+
+
+def melde(text):
+    print(f"\n>>> {text}")
+
+
+def schritt_pakete():
+    melde("Schritt 1/5: Pakete prüfen")
+    fehlt = []
+    for paket, zweck in [("cryptography", "Verschlüsselung"),
+                         ("customtkinter", "Oberfläche"),
+                         ("PIL", "Icon"),
+                         ("PyInstaller", "Bauen der .exe")]:
+        try:
+            __import__(paket)
+            print(f"    [OK] {paket}  ({zweck})")
+        except ImportError:
+            fehlt.append(paket)
+            print(f"    [FEHLT] {paket}  ({zweck})")
+    if fehlt:
+        namen = {"PIL": "pillow", "PyInstaller": "pyinstaller"}
+        print("\nBitte zuerst installieren:")
+        print("    pip install " + " ".join(namen.get(p, p) for p in fehlt))
+        return False
+    return True
+
+
+def schritt_test():
+    melde("Schritt 2/5: Selbsttest")
+    ergebnis = subprocess.run([sys.executable, str(ORDNER / "test_vp4.py")],
+                              cwd=ORDNER, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+    letzte = [z for z in (ergebnis.stdout or "").splitlines() if z.strip()][-6:]
+    for z in letzte:
+        print("    " + z)
+    if ergebnis.returncode != 0:
+        print("\n    Der Selbsttest ist fehlgeschlagen - es wird nicht gebaut.")
+        print("    Erst den Fehler beheben, sonst verschickst du ein kaputtes Programm.")
+        return False
+    return True
+
+
+def schritt_icon():
+    melde("Schritt 3/5: Icon erzeugen")
+    ergebnis = subprocess.run([sys.executable, str(ORDNER / "icon_erzeugen.py")],
+                              cwd=ORDNER, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+    if ergebnis.returncode != 0:
+        print("    Icon konnte nicht erzeugt werden - es wird ohne gebaut.")
+        return None
+    print("    [OK] vp4.ico")
+    return ORDNER / "vp4.ico"
+
+
+def schritt_bauen(icon):
+    melde("Schritt 4/5: .exe bauen (das dauert ein paar Minuten)")
+    for ordner in ("build", "dist"):
+        shutil.rmtree(ORDNER / ordner, ignore_errors=True)
+
+    befehl = [
+        sys.executable, "-m", "PyInstaller",
+        "--onefile",           # alles in eine einzige Datei
+        "--noconsole",         # kein schwarzes Konsolenfenster daneben
+        "--name", NAME,
+        "--noconfirm",
+        # Ohne das fehlen CustomTkinter die Design-Dateien und die .exe
+        # stürzt beim Start ab, ohne zu sagen warum.
+        "--collect-all", "customtkinter",
+    ]
+    if icon:
+        befehl += ["--icon", str(icon)]
+    befehl.append(str(ORDNER / "VP4.py"))
+
+    start = time.time()
+    ergebnis = subprocess.run(befehl, cwd=ORDNER, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+    if ergebnis.returncode != 0:
+        print("    Bauen fehlgeschlagen:")
+        for z in (ergebnis.stderr or "").splitlines()[-15:]:
+            print("    " + z)
+        return None
+
+    exe = ORDNER / "dist" / f"{NAME}.exe"
+    if not exe.exists():
+        print("    Die .exe wurde nicht gefunden.")
+        return None
+    mb = exe.stat().st_size / 1024 / 1024
+    print(f"    [OK] {exe.name} — {mb:.1f} MB, gebaut in {time.time() - start:.0f} Sekunden")
+    return exe
+
+
+def schritt_probelauf(exe):
+    melde("Schritt 5/5: Probelauf")
+    # Die .exe kurz starten und schauen, ob sie am Leben bleibt. Startet sie
+    # gar nicht, ist sie sofort wieder weg - genau das passiert z.B., wenn
+    # CustomTkinter seine Design-Dateien nicht findet.
+    lauf = subprocess.Popen([str(exe)], cwd=exe.parent)
+    time.sleep(9)
+    laeuft = lauf.poll() is None
+    if laeuft:
+        print("    [OK] Die .exe startet und läuft.")
+        lauf.terminate()
+        try:
+            lauf.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            lauf.kill()
+    else:
+        print(f"    [FEHLER] Die .exe hat sich sofort beendet "
+              f"(Rückgabewert {lauf.returncode}).")
+        print("    Zum Nachsehen einmal ohne --noconsole bauen, dann wird der")
+        print("    Fehler im Konsolenfenster sichtbar.")
+    return laeuft
+
+
+def main():
+    print("=" * 64)
+    print(" VP4 bauen")
+    print("=" * 64)
+
+    if not schritt_pakete():
+        return 1
+    if not schritt_test():
+        return 1
+    icon = schritt_icon()
+    exe = schritt_bauen(icon)
+    if exe is None:
+        return 1
+    if not schritt_probelauf(exe):
+        return 1
+
+    print("\n" + "=" * 64)
+    print(f" FERTIG:  {exe}")
+    print("=" * 64)
+    print("\nDiese eine Datei kannst du verschicken oder bei GitHub als")
+    print("Release hochladen. Wer sie bekommt, braucht kein Python.")
+    print("\nHinweis für deine Freunde: Windows zeigt beim ersten Start")
+    print("wahrscheinlich eine Warnung ('Windows hat den Start geschützt'),")
+    print("weil die Datei nicht kostenpflichtig signiert ist. Über")
+    print("'Weitere Informationen' -> 'Trotzdem ausführen' geht es weiter.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

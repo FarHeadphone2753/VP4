@@ -1,0 +1,89 @@
+# =====================================================================
+#  Baut VP4.exe automatisch und hängt sie an ein GitHub-Release
+# =====================================================================
+# Damit musst du die .exe nicht mehr selbst bauen und hochladen. Ablauf:
+#
+#     git tag v4.1
+#     git push origin v4.1
+#
+# GitHub baut daraufhin auf einem eigenen Windows-Rechner, lässt den
+# Selbsttest laufen und legt ein Release mit der fertigen VP4.exe an.
+# Deine Freunde laden sie dann einfach unter "Releases" herunter.
+#
+# Der Selbsttest läuft dabei ohne Fenster (VP4_TEST_OHNE_GUI), weil auf
+# GitHubs Rechnern kein Bildschirm angeschlossen ist.
+# =====================================================================
+
+name: VP4.exe bauen und veröffentlichen
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Erlaubt außerdem, den Bau von Hand über den Actions-Reiter zu starten
+  workflow_dispatch:
+
+permissions:
+  contents: write        # nötig, um das Release anlegen zu dürfen
+
+jobs:
+  bauen:
+    runs-on: windows-latest
+
+    steps:
+      - name: Quelltext holen
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pakete installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install cryptography customtkinter pillow pyinstaller
+
+      - name: Selbsttest
+        env:
+          VP4_TEST_OHNE_GUI: "1"     # auf GitHubs Rechnern gibt es keinen Bildschirm
+        run: python test_vp4.py
+
+      - name: Icon erzeugen
+        run: python icon_erzeugen.py
+
+      - name: VP4.exe bauen
+        run: >
+          pyinstaller --onefile --noconsole --name VP4
+          --icon vp4.ico --collect-all customtkinter --noconfirm VP4.py
+
+      - name: Nachsehen, ob die .exe entstanden ist
+        run: |
+          if (-not (Test-Path dist/VP4.exe)) { throw "dist/VP4.exe fehlt" }
+          $mb = [math]::Round((Get-Item dist/VP4.exe).Length / 1MB, 1)
+          Write-Output "VP4.exe gebaut: $mb MB"
+
+      - name: Auch ohne Release zum Herunterladen bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: VP4-exe
+          path: dist/VP4.exe
+
+      - name: Release anlegen
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/VP4.exe
+          generate_release_notes: true
+          body: |
+            ## Herunterladen
+
+            **`VP4.exe`** unten anklicken, herunterladen, doppelklicken.
+            Du brauchst kein Python und musst nichts installieren.
+
+            Windows zeigt beim ersten Start eine Warnung, weil das Programm
+            nicht kostenpflichtig signiert ist:
+            **Weitere Informationen** → **Trotzdem ausführen**.
+
+            Beim ersten Start legst du ein Master-Passwort fest. Schreib es
+            dir auf – es lässt sich nicht wiederherstellen.
