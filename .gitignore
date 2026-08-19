@@ -1,0 +1,13 @@
+# Persönliche Programmdaten - NIEMALS committen.
+# Hier liegen der verschlüsselte Schlüsselspeicher, die eigene Chat-ID,
+# die Freundesliste und alle empfangenen Dateien.
+vp4_daten/
+
+# PyInstaller-Build-Ergebnisse
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
