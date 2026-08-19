@@ -64,8 +64,47 @@ Kryptografie).
   kein Path-Traversal möglich); Limit 300 MB pro Datei, Verschlüsselung nur
   bis 50 MB (sonst unverschlüsselter Versand mit Warnhinweis).
 
-**Getestet wurde (in der Cloud-Sandbox, Linux mit Xvfb, nicht auf echtem
-Windows):**
+## Stand nach der ersten lokalen Sitzung (Windows, August 2026)
+
+Das Projekt liegt jetzt unter Git (`git log` zeigt die Historie), damit
+jede Änderung nachvollziehbar und rücknehmbar ist. `vp4_daten/` ist per
+`.gitignore` ausgeschlossen – dort liegen Schlüsselspeicher, eigene
+Chat-ID und empfangene Dateien, die gehören nicht ins Repo.
+
+**Neu: `test_vp4.py`** – ein Selbsttest, der mit `python test_vp4.py`
+läuft und aktuell 42 Prüfungen durchgeht (Chiffren, AES/RSA,
+Schlüsselspeicher, Obsidian-Roundtrip, Chat zwischen zwei echten
+`ChatNetwork`-Instanzen über localhost, GUI-Aufbau). **Bitte nach jeder
+Änderung an `VP4.py` laufen lassen.** Die Datei gehört nicht ins fertige
+Programm – die `.exe` wird weiterhin nur aus `VP4.py` gebaut.
+
+Auf echtem Windows verifiziert: Python 3.13, `cryptography` 46,
+Fenster öffnet, alle fünf Tabs rendern, Chat-Netzwerk startet und stoppt
+sauber.
+
+**Drei ernste Fehler wurden dabei gefunden und behoben** (Details in den
+Commit-Nachrichten) – alle drei stammen daher, dass in der Linux-Sandbox
+niemand mit deutschen Texten, langen Schlüsseln oder echten
+Verbindungsabbrüchen getestet hat:
+
+1. **Vigenère zerstörte Umlaute.** Aus `äöüß` wurde `btzw`, der Klartext
+   war unwiederbringlich weg. Ursache: `ch.isalpha()` ist in Python auch
+   für `ä` wahr, die Rechnung darunter ist aber reines ASCII.
+2. **Der Obsidian-Export zerstörte lange Schlüssel.** Werte wurden bei
+   120 Zeichen abgeschnitten; ein RSA-Schlüssel ist rund 1700 Zeichen
+   lang und kam unbrauchbar zurück. Wer sich auf Obsidian als Sicherung
+   verlassen hätte, hätte den Schlüssel verloren.
+3. **Ein abgestürzter Empfangs-Thread machte einen Freund unerreichbar.**
+   Eine verschlüsselte Nachricht ohne hinterlegten gemeinsamen Schlüssel
+   ließ den Thread sterben; die tote Verbindung blieb in der Liste
+   stehen und blockierte alles Weitere bis zum Neustart.
+
+**Noch offen:** die `.exe` wurde weiterhin nicht gebaut, und der Chat
+lief noch nicht zwischen zwei *echten* PCs im WLAN (nur über localhost).
+Das Verhalten der Windows-Firewall ist damit weiter ungeklärt.
+
+**Getestet wurde ursprünglich (in der Cloud-Sandbox, Linux mit Xvfb,
+nicht auf echtem Windows):**
 - Alle Chiffren inkl. Roundtrip und Fehlerfälle (falscher Schlüssel etc.)
 - Schlüsselspeicher: anlegen, entsperren, falsches Passwort, doppelte Namen
 - Obsidian-Export/-Import inkl. Erhalt von handgeschriebenem Notizinhalt
@@ -106,9 +145,15 @@ Windows):**
 5. Geh die "Offene Punkte" unten mit Leon durch, bevor du größere
    Design-Entscheidungen (z. B. UI-Neugestaltung) triffst – nicht raten,
    nachfragen.
-6. Behalte die Architektur bei (eine Python-Datei, `cryptography` als
-   einzige externe Abhängigkeit, Daten unter `vp4_daten/`), außer Leon sagt
-   explizit, dass er etwas anderes will.
+6. Behalte die Architektur bei (das *Programm* bleibt eine einzige
+   Python-Datei, `cryptography` als einzige externe Abhängigkeit, Daten
+   unter `vp4_daten/`), außer Leon sagt explizit, dass er etwas anderes
+   will. Leon hat das im August 2026 nochmal ausdrücklich bestätigt.
+   `test_vp4.py` ist davon ausgenommen – es ist Testwerkzeug, kein
+   Programmteil, und landet nicht in der `.exe`.
+7. Nach jeder Änderung an `VP4.py`: `python test_vp4.py` laufen lassen.
+   Wenn du etwas reparierst, ergänze vorher eine Prüfung, die den Fehler
+   zeigt – dann ist belegt, dass der Fix wirklich greift.
 
 ## Offene Punkte – bitte mit Leon klären, nicht raten
 
