@@ -303,7 +303,121 @@ def test_obsidian():
 
 
 # ---------------------------------------------------------------------------
-#  5) Programmfenster - baut die GUI fehlerfrei auf?
+#  5) Chat - zwei Instanzen reden wirklich miteinander
+# ---------------------------------------------------------------------------
+
+def test_chat():
+    print("\n=== Chat zwischen zwei Instanzen ===")
+
+    import queue
+    import time
+
+    PORT = 51951          # eigener Port, damit ein laufendes VP4 nicht stört
+
+    class TestFreunde:
+        """Ersetzt FriendsStore, damit der Test nichts auf die Platte schreibt."""
+        def __init__(self, eintraege):
+            self._d = dict(eintraege)
+
+        def __contains__(self, fid):
+            return fid in self._d
+
+        def get(self, fid):
+            return self._d.get(fid)
+
+        def all(self):
+            return dict(self._d)
+
+    def warte_auf(q, art, sekunden=5.0):
+        ende = time.time() + sekunden
+        while time.time() < ende:
+            try:
+                typ, daten = q.get(timeout=0.2)
+                if typ == art:
+                    return daten
+            except queue.Empty:
+                pass
+        return None
+
+    ordner = tempfile.mkdtemp()
+    empfangs_ordner_vorher = VP4.RECEIVED_DIR
+    VP4.RECEIVED_DIR = Path(ordner)     # echte empfangene Dateien nicht anfassen
+
+    a = b = None
+    try:
+        gemeinsam = VP4.ModernCrypto.generate_aes_key()
+        ereignisse_a, ereignisse_b = queue.Queue(), queue.Queue()
+
+        # A kennt B, hat aber (noch) KEINEN gemeinsamen Schlüssel hinterlegt.
+        a = VP4.ChatNetwork(
+            "AAAA-1111",
+            TestFreunde({"BBBB-2222": {"nickname": "B", "shared_key_b64": None}}),
+            ereignisse_a, chat_port=PORT, broadcast_port=PORT + 1,
+            bind_host="127.0.0.1")
+        # B hat den Schlüssel gesetzt und sendet deshalb verschlüsselt.
+        b = VP4.ChatNetwork(
+            "BBBB-2222",
+            TestFreunde({"AAAA-1111": {"nickname": "A", "shared_key_b64": gemeinsam}}),
+            ereignisse_b, chat_port=PORT, broadcast_port=PORT + 1,
+            bind_host="127.0.0.1")
+
+        a.start()                       # A ist der Server
+        time.sleep(0.5)
+        b._running = True               # B nur als Gegenstelle, kein zweiter Server
+        with b._peers_lock:
+            b.peers["AAAA-1111"] = ("127.0.0.1", time.time())
+
+        # --- Der Fall, an dem die Verbindung früher gestorben ist ----------
+        # B schickt verschlüsselt, A kann es nicht lesen. Früher ist dabei
+        # der Empfangs-Thread von A abgestürzt, und danach ging gar nichts
+        # mehr - bis zum Neustart des Programms.
+        b.send_text("AAAA-1111", "Das kann A noch nicht lesen")
+        R.pruefe("Nicht entschlüsselbare Nachricht gibt eine Meldung",
+                 warte_auf(ereignisse_a, "error") is not None)
+
+        # Jetzt hat A denselben Schlüssel - die Verbindung muss noch stehen.
+        a.friends.get("BBBB-2222")["shared_key_b64"] = gemeinsam
+        b.send_text("AAAA-1111", "Und das hier schon - mit Umlauten: äöüß")
+        nachricht = warte_auf(ereignisse_a, "message")
+        R.pruefe("Die Verbindung überlebt eine unlesbare Nachricht",
+                 nachricht is not None,
+                 "A empfängt nichts mehr - die Verbindung war tot")
+        if nachricht:
+            R.pruefe("Nachricht kommt unverändert an (auch mit Umlauten)",
+                     nachricht["text"] == "Und das hier schon - mit Umlauten: äöüß",
+                     f"bekam: {nachricht['text']!r}")
+            R.pruefe("Nachricht wurde verschlüsselt übertragen",
+                     nachricht["encrypted"] is True)
+
+        # --- Verschlüsselte Datei übertragen -------------------------------
+        quelle = Path(ordner) / "testbild.png"
+        quelle.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 400)
+        b.send_file("AAAA-1111", str(quelle), "bild")
+        datei = warte_auf(ereignisse_a, "file")
+        R.pruefe("Verschlüsselte Datei kommt an", datei is not None)
+        if datei:
+            R.pruefe("Die empfangene Datei ist Byte für Byte identisch",
+                     Path(datei["path"]).read_bytes() == quelle.read_bytes())
+
+        # --- Läuft die Verbindung nach der Datei weiter? -------------------
+        b.send_text("AAAA-1111", "Noch eine Nachricht nach der Datei")
+        R.pruefe("Nach einer Dateiübertragung geht das Chatten weiter",
+                 warte_auf(ereignisse_a, "message") is not None)
+    except Exception as e:
+        R.fehlschlag("Chat", e)
+        traceback.print_exc()
+    finally:
+        VP4.RECEIVED_DIR = empfangs_ordner_vorher
+        for netz in (a, b):
+            if netz is not None:
+                try:
+                    netz.stop()
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+#  6) Programmfenster - baut die GUI fehlerfrei auf?
 # ---------------------------------------------------------------------------
 
 def test_gui():
@@ -366,6 +480,7 @@ def main():
     test_moderne_krypto()
     test_schluesselspeicher()
     test_obsidian()
+    test_chat()
     test_gui()
 
     print("\n" + "=" * 62)

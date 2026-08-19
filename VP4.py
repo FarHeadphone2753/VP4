@@ -851,59 +851,130 @@ class ChatNetwork:
                 pass
 
     def _read_loop(self, friend_id: str, conn: socket.socket):
-        while self._running:
-            try:
-                flags, msgtype, payload = self._recv_frame(conn)
-            except (ConnectionError, OSError, struct.error):
-                break
-            if msgtype == MSG_TEXT:
-                text = self._maybe_decrypt(friend_id, flags, payload).decode("utf-8", errors="replace")
-                self.events.put(("message", {"from": friend_id, "text": text,
-                                              "encrypted": bool(flags & 1)}))
-            elif msgtype == MSG_META:
-                meta_raw = self._maybe_decrypt(friend_id, flags, payload)
+        try:
+            while self._running:
                 try:
-                    meta = json.loads(meta_raw.decode("utf-8"))
-                except json.JSONDecodeError:
-                    continue
-                self._receive_data_frame(friend_id, conn, meta)
-        with self._conn_lock:
-            if self._connections.get(friend_id) is conn:
-                del self._connections[friend_id]
+                    flags, msgtype, payload = self._recv_frame(conn)
+                except (ConnectionError, OSError, struct.error):
+                    break
 
-    def _receive_data_frame(self, friend_id: str, conn: socket.socket, meta: dict):
+                if msgtype == MSG_TEXT:
+                    try:
+                        klartext = self._maybe_decrypt(friend_id, flags, payload)
+                    except Exception:
+                        # Die Nachricht kam verschlüsselt an, aber der
+                        # gemeinsame Schlüssel fehlt oder passt nicht. Nur
+                        # diese eine Nachricht verwerfen - die Verbindung
+                        # muss deswegen nicht abgebrochen werden.
+                        self.events.put(("error",
+                            f"Eine Nachricht von {friend_id} konnte nicht entschlüsselt "
+                            f"werden. Habt ihr beide denselben gemeinsamen Schlüssel "
+                            f"hinterlegt?"))
+                        continue
+                    self.events.put(("message", {
+                        "from": friend_id,
+                        "text": klartext.decode("utf-8", errors="replace"),
+                        "encrypted": bool(flags & 1),
+                    }))
+
+                elif msgtype == MSG_META:
+                    try:
+                        meta_raw = self._maybe_decrypt(friend_id, flags, payload)
+                        meta = json.loads(meta_raw.decode("utf-8"))
+                    except Exception:
+                        # Ohne die Ankündigung wissen wir nicht, wie viele
+                        # Bytes gleich folgen. Ab hier ist der Datenstrom
+                        # nicht mehr sauber zu lesen - Verbindung beenden,
+                        # sie wird beim nächsten Senden neu aufgebaut.
+                        self.events.put(("error",
+                            f"Die Dateiankündigung von {friend_id} war unlesbar - "
+                            f"Verbindung getrennt."))
+                        break
+                    if not self._receive_data_frame(friend_id, conn, meta):
+                        break
+        finally:
+            # Das muss auch bei einem unerwarteten Fehler passieren. Sonst
+            # bleibt eine längst tote Verbindung in der Liste stehen, das
+            # Programm hält sie für intakt, und ab da schlägt jedes weitere
+            # Senden an diesen Freund fehl - bis VP4 neu gestartet wird.
+            with self._conn_lock:
+                if self._connections.get(friend_id) is conn:
+                    del self._connections[friend_id]
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _receive_data_frame(self, friend_id: str, conn: socket.socket, meta: dict) -> bool:
+        """Empfängt den Datenblock, der auf eine Dateiankündigung folgt.
+
+        Rückgabe: True, wenn danach auf der Verbindung weitergelesen werden
+        kann, False, wenn sie beendet werden muss.
+        """
         try:
             header = self._recv_exact(conn, 6)
-        except (ConnectionError, OSError):
-            return
+        except (ConnectionError, OSError, struct.error):
+            return False
         flags, msgtype, length = struct.unpack("!BBI", header)
+
         if msgtype != MSG_DATA or length > MAX_FILE_SIZE:
-            self._recv_exact(conn, min(length, MAX_FILE_SIZE))
-            return
+            # Hier stimmt etwas nicht. Den angekündigten Rest einfach
+            # wegzulesen wäre gefährlich - die Länge kann beliebig groß
+            # angegeben sein. Also lieber die Verbindung beenden, sie wird
+            # beim nächsten Senden automatisch neu aufgebaut.
+            self.events.put(("error",
+                f"Ungültige Dateiübertragung von {friend_id} - Verbindung getrennt."))
+            return False
+
+        if (flags & 1) and length > MAX_ENCRYPTED_FILE_SIZE + 65536:
+            # Eine verschlüsselte Datei muss am Stück in den Arbeitsspeicher.
+            # Beim Senden gilt dafür ein Limit von 50 MB - beim Empfangen
+            # dieselbe Grenze ziehen, sonst könnte uns eine einzige
+            # Übertragung den Speicher volllaufen lassen.
+            self.events.put(("error",
+                f"Verschlüsselte Datei von {friend_id} ist zu groß - Verbindung getrennt."))
+            return False
 
         safe_name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}_{Path(meta.get('name') or 'datei').name}"
         out_path = RECEIVED_DIR / safe_name
 
-        if flags & 1:
-            # Verschlüsselt -> komplett im Speicher empfangen und entschlüsseln
-            raw = self._recv_exact(conn, length)
+        try:
+            if flags & 1:
+                # Verschlüsselt -> komplett im Speicher empfangen und entschlüsseln
+                raw = self._recv_exact(conn, length)
+                try:
+                    data = self._maybe_decrypt(friend_id, flags, raw)
+                except Exception:
+                    self.events.put(("error",
+                        f"Die Datei von {friend_id} konnte nicht entschlüsselt werden. "
+                        f"Habt ihr beide denselben gemeinsamen Schlüssel hinterlegt?"))
+                    # Der Datenstrom selbst ist in Ordnung - es wurden genau
+                    # so viele Bytes gelesen wie angekündigt. Nur der Inhalt
+                    # ist unlesbar. Die Verbindung bleibt bestehen.
+                    return True
+                out_path.write_bytes(data)
+            else:
+                # Unverschlüsselt -> direkt in Datei streamen (spart RAM bei Videos)
+                remaining = length
+                with open(out_path, "wb") as f:
+                    while remaining > 0:
+                        chunk = self._recv_exact(conn, min(65536, remaining))
+                        f.write(chunk)
+                        remaining -= len(chunk)
+        except (ConnectionError, OSError, struct.error):
+            # Übertragung mittendrin abgebrochen, z.B. weil das WLAN kurz weg
+            # war. Die halb geschriebene Datei ist wertlos und würde sonst als
+            # scheinbar gültiges Bild/Video im Ordner liegen bleiben.
             try:
-                data = self._maybe_decrypt(friend_id, flags, raw)
-            except Exception:
-                self.events.put(("error", f"Konnte Datei von {friend_id} nicht entschlüsseln."))
-                return
-            out_path.write_bytes(data)
-        else:
-            # Unverschlüsselt -> direkt in Datei streamen (spart RAM bei Videos)
-            remaining = length
-            with open(out_path, "wb") as f:
-                while remaining > 0:
-                    chunk = self._recv_exact(conn, min(65536, remaining))
-                    f.write(chunk)
-                    remaining -= len(chunk)
+                if out_path.exists():
+                    out_path.unlink()
+            except OSError:
+                pass
+            return False
 
         self.events.put(("file", {"from": friend_id, "path": str(out_path),
                                    "kind": meta.get("kind", "file"), "name": meta.get("name", safe_name)}))
+        return True
 
     # ---------------- TCP: Client / Senden ----------------
 
