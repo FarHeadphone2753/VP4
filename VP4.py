@@ -490,6 +490,79 @@ class ObsidianSync:
     def note_path(self) -> Path:
         return self.vault_path / self.NOTE_NAME
 
+    @staticmethod
+    def _wert_kodieren(wert) -> str:
+        """Macht aus einem Schlüssel einen einzeiligen, tabellensicheren Text.
+
+        Eine Zelle in einer Markdown-Tabelle darf weder einen Zeilenumbruch
+        noch ein "|" enthalten - beides würde die Tabelle zerreißen. Deshalb
+        wird beides umkehrbar ersetzt, und der Backslash selbst gleich mit,
+        damit die Rückwandlung eindeutig bleibt.
+
+        Gekürzt wird hier bewusst NICHT: ein RSA-Schlüssel ist im PEM-Format
+        rund 1700 Zeichen lang und enthält knapp 30 Zeilenumbrüche. Früher
+        wurde er auf 120 Zeichen abgeschnitten - der Export sah ordentlich
+        aus, aber der Schlüssel war beim Zurücklesen unbrauchbar, und damit
+        auch alles, was mit ihm verschlüsselt wurde.
+        """
+        return (str(wert)
+                .replace("\\", "\\\\")
+                .replace("\r\n", "\\n")
+                .replace("\n", "\\n")
+                .replace("\r", "\\n")
+                .replace("|", "\\|"))
+
+    @staticmethod
+    def _zeile_aufteilen(zeile: str) -> list:
+        """Teilt eine Zeile der Markdown-Tabelle an den echten Trennstrichen.
+
+        Ein "|", das zum Inhalt gehört, steht als "\\|" in der Zeile und ist
+        kein Spaltentrenner. Ein einfaches split("|") würde die Zeile an
+        dieser Stelle fälschlich auseinanderreißen.
+        """
+        spalten = []
+        aktuell = []
+        i = 0
+        while i < len(zeile):
+            ch = zeile[i]
+            if ch == "\\" and i + 1 < len(zeile):
+                # Escape-Sequenz unangetastet übernehmen - das Dekodieren
+                # passiert später in _wert_dekodieren().
+                aktuell.append(ch)
+                aktuell.append(zeile[i + 1])
+                i += 2
+                continue
+            if ch == "|":
+                spalten.append("".join(aktuell))
+                aktuell = []
+                i += 1
+                continue
+            aktuell.append(ch)
+            i += 1
+        spalten.append("".join(aktuell))
+        return spalten
+
+    @staticmethod
+    def _wert_dekodieren(wert: str) -> str:
+        """Macht _wert_kodieren() wieder rückgängig."""
+        out = []
+        i = 0
+        while i < len(wert):
+            ch = wert[i]
+            if ch == "\\" and i + 1 < len(wert):
+                folgt = wert[i + 1]
+                if folgt == "n":
+                    out.append("\n")
+                    i += 2
+                    continue
+                if folgt in ("|", "\\"):
+                    out.append(folgt)
+                    i += 2
+                    continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
     def export_keys(self, keys: list) -> Path:
         lines = [self.START_MARK, ""]
         lines.append(f"Zuletzt synchronisiert: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -500,10 +573,8 @@ class ObsidianSync:
         lines.append("| Name | Typ | Wert | Notiz | Erstellt |")
         lines.append("|---|---|---|---|---|")
         for k in keys:
-            wert = str(k["wert"]).replace("\n", " ").replace("|", "\\|")
-            if len(wert) > 120:
-                wert = wert[:117] + "..."
-            meta = str(k.get("meta", "")).replace("|", "\\|")
+            wert = self._wert_kodieren(k["wert"])
+            meta = self._wert_kodieren(k.get("meta", ""))
             lines.append(f"| {k['label']} | {k['typ']} | `{wert}` | {meta} | {k.get('erstellt', '')} |")
         lines.append("")
         lines.append(self.END_MARK)
@@ -529,18 +600,47 @@ class ObsidianSync:
             raise ValueError(f"Keine Datei '{self.NOTE_NAME}' im Vault gefunden.")
         content = self.note_path.read_text(encoding="utf-8")
         imported = []
+        beschaedigt = []
         for line in content.splitlines():
             line = line.strip()
             if not line.startswith("|") or line.startswith("|---") or line.startswith("| Name |"):
                 continue
-            cols = [c.strip() for c in line.strip("|").split("|")]
+            cols = self._zeile_aufteilen(line)
+            # Vor dem ersten und hinter dem letzten "|" steht nichts - weg damit.
+            # (Nicht mit line.strip("|") machen: das würde einem Wert, der auf
+            # ein escaptes "\|" endet, den Strich wegschneiden.)
+            if cols and not cols[0].strip():
+                cols = cols[1:]
+            if cols and not cols[-1].strip():
+                cols = cols[:-1]
+            cols = [c.strip() for c in cols]
             if len(cols) < 5:
                 continue
             label, typ, wert, meta, erstellt = cols[0], cols[1], cols[2], cols[3], cols[4]
-            wert = wert.strip("`")
+            # Der Wert steht beim Export in Backticks - genau ein Paar entfernen.
+            if len(wert) >= 2 and wert.startswith("`") and wert.endswith("`"):
+                wert = wert[1:-1]
+            wert = self._wert_dekodieren(wert)
+            meta = self._wert_dekodieren(meta)
             if not label:
                 continue
+            # Notizen, die noch mit einer älteren Programmversion geschrieben
+            # wurden, können abgeschnittene Schlüssel enthalten - erkennbar am
+            # angehängten "...". Die sind nicht mehr zu retten. Besser einmal
+            # deutlich sagen als stillschweigend einen kaputten Schlüssel
+            # zurückgeben, mit dem sich später nichts mehr entschlüsseln lässt.
+            if wert.endswith("..."):
+                beschaedigt.append(label)
             imported.append({"label": label, "typ": typ, "wert": wert, "meta": meta, "erstellt": erstellt})
+        if beschaedigt:
+            raise ValueError(
+                "Diese Schlüssel wurden von einer älteren Programmversion beim "
+                "Export abgeschnitten und sind unvollständig:\n\n  - "
+                + "\n  - ".join(beschaedigt)
+                + "\n\nSie lassen sich nicht mehr reparieren. Falls du sie noch "
+                  "im Schlüsselspeicher des Programms hast, exportiere sie "
+                  "bitte einmal neu - dann werden sie vollständig geschrieben."
+            )
         return imported
 
 
