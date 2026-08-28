@@ -51,6 +51,9 @@ import dateien
 import krypto
 import speicher
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import asyncio
+
+import chat
 from chat import ChatNetwork
 from krypto import (VERFAHREN, SCHLUESSEL_ARTEN, ClassicCiphers, ModernCrypto,
                     Pruefsummen, Signaturen)
@@ -95,6 +98,22 @@ def _wirft_valueerror(funktion, *argumente) -> bool:
     try:
         funktion(*argumente)
     except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _wirft_fehler(funktion, art, *argumente) -> bool:
+    """Wie _wirft_valueerror(), aber für eine beliebige Fehlerart.
+
+    Beim Chat kommt es darauf an, WELCHER Fehler gemeldet wird: ein
+    ConnectionError heißt "gerade kein Weg offen", ein ValueError heißt
+    "so nicht" - die Oberfläche schreibt Verschiedenes daraufhin.
+    """
+    try:
+        funktion(*argumente)
+    except art:
         return True
     except Exception:
         return False
@@ -993,6 +1012,619 @@ def test_chat():
 #  9) Verfahrensliste
 # ---------------------------------------------------------------------------
 
+def test_discord():
+    """Der Weg über Discord - Protokoll und Wegwahl, beides ohne Netz.
+
+    Eine echte Verbindung zu Discord braucht Token, Kanal und Internet und
+    hätte in einem Selbsttest nichts verloren. Prüfbar ist trotzdem alles,
+    worauf es ankommt: dass die Zeilen richtig gebaut und wieder
+    zusammengesetzt werden, dass fremde Zeilen liegen bleiben, und dass der
+    Vermittler den richtigen Weg wählt.
+    """
+    print("\n=== Chat über Discord ===")
+
+    import discord_transport
+    import transport
+    from discord_transport import DiscordProtokoll
+
+    class TestFreunde:
+        def __init__(self, eintraege):
+            self._d = dict(eintraege)
+
+        def __contains__(self, fid):
+            return fid in self._d
+
+        def get(self, fid):
+            return self._d.get(fid)
+
+        def all(self):
+            return dict(self._d)
+
+    gemeinsam = ModernCrypto.generate_aes_key()
+    fremder = ModernCrypto.generate_aes_key()
+
+    freunde_a = TestFreunde({"BBBB-2222": {"nickname": "B", "shared_key_b64": gemeinsam},
+                             "CCCC-3333": {"nickname": "C", "shared_key_b64": None}})
+    freunde_b = TestFreunde({"AAAA-1111": {"nickname": "A", "shared_key_b64": gemeinsam}})
+
+    a = DiscordProtokoll("AAAA-1111", freunde_a)
+    b = DiscordProtokoll("BBBB-2222", freunde_b)
+
+    # --- Hin und zurück ----------------------------------------------------
+    zeilen = a.zeilen_bauen("BBBB-2222", TESTTEXT.encode("utf-8"))
+    R.pruefe("Eine kurze Nachricht passt in eine einzige Zeile", len(zeilen) == 1)
+    R.pruefe("Der Klartext steht nicht in der Zeile",
+             TESTTEXT[:20] not in zeilen[0] and "Straße" not in zeilen[0])
+
+    gelesen = b.zeile_lesen(zeilen[0])
+    R.pruefe("Die Gegenstelle liest die Nachricht wieder aus",
+             gelesen is not None and gelesen[2].decode("utf-8") == TESTTEXT,
+             f"bekommen: {gelesen}")
+    R.pruefe("Der Absender steht richtig drin",
+             gelesen is not None and gelesen[0] == "AAAA-1111")
+
+    # --- Was liegen bleiben muss ------------------------------------------
+    R.pruefe("Das eigene Echo aus dem Kanal wird übersprungen",
+             a.zeile_lesen(zeilen[0]) is None)
+    R.pruefe("Eine Zeile für einen anderen Freund wird übersprungen",
+             DiscordProtokoll("DDDD-4444", freunde_b).zeile_lesen(zeilen[0]) is None)
+    R.pruefe("Eine Zeile von einem Unbekannten wird übersprungen",
+             DiscordProtokoll("BBBB-2222", TestFreunde({})).zeile_lesen(zeilen[0]) is None)
+    R.pruefe("Fremdes Geplauder im Kanal stört nicht",
+             b.zeile_lesen("Hallo, ich bin einfach nur eine normale Nachricht") is None)
+    R.pruefe("Eine abgeschnittene Zeile stört nicht",
+             b.zeile_lesen("VP4D1|AAAA-1111|BBBB-2222|XY") is None)
+
+    # --- Fälschen scheitert an der Prüfsumme -------------------------------
+    boese = DiscordProtokoll(
+        "AAAA-1111",
+        TestFreunde({"BBBB-2222": {"nickname": "B", "shared_key_b64": fremder}}))
+    gefaelscht = boese.zeilen_bauen("BBBB-2222", b"Ich bin angeblich A")
+    R.pruefe("Eine Zeile mit fremdem Schlüssel wird abgelehnt",
+             _wirft_valueerror(b.zeile_lesen, gefaelscht[0]))
+
+    # --- Ohne gemeinsamen Schlüssel geht über Discord gar nichts -----------
+    R.pruefe("Ohne gemeinsamen Schlüssel wird nicht gesendet",
+             _wirft_valueerror(a.zeilen_bauen, "CCCC-3333", b"Klartext"))
+
+    # --- Lange Nachrichten werden zerlegt ----------------------------------
+    lang = ("Zeile mit Umlauten äöüß - " * 400).encode("utf-8")
+    teile = a.zeilen_bauen("BBBB-2222", lang)
+    R.pruefe("Eine lange Nachricht wird auf mehrere Zeilen verteilt", len(teile) > 1,
+             f"{len(teile)} Teile")
+    R.pruefe("Keine Zeile überschreitet Discords Grenze von 2000 Zeichen",
+             all(len(z) <= 2000 for z in teile),
+             f"längste: {max(len(z) for z in teile)}")
+
+    for z in teile[:-1]:
+        R.pruefe("Solange Teile fehlen, gibt es noch nichts",
+                 b.zeile_lesen(z) is None)
+    ganz = b.zeile_lesen(teile[-1])
+    R.pruefe("Mit dem letzten Teil ist die Nachricht wieder vollständig",
+             ganz is not None and ganz[2] == lang)
+
+    # Discord garantiert die Reihenfolge nicht, wenn mehrere Zeilen kurz
+    # hintereinander abgeschickt werden - rückwärts muss es genauso gehen.
+    teile = a.zeilen_bauen("BBBB-2222", lang)
+    for z in reversed(teile[1:]):
+        b.zeile_lesen(z)
+    ganz = b.zeile_lesen(teile[0])
+    R.pruefe("Auch in verkehrter Reihenfolge kommt die Nachricht an",
+             ganz is not None and ganz[2] == lang)
+
+    # --- Der Vermittler: welcher Weg wird genommen? ------------------------
+    class LanAttrappe:
+        def __init__(self, online=()):
+            self.online = set(online)
+            self.gesendet = []
+            self.server_laeuft = False
+            self.chat_port = 41230
+            self.broadcast_port = 41231
+
+        def start(self):
+            self.server_laeuft = True
+
+        def stop(self):
+            self.server_laeuft = False
+
+        def online_ids(self):
+            return set(self.online)
+
+        def is_online(self, fid):
+            return fid in self.online
+
+        def send_text(self, fid, text):
+            if fid not in self.online:
+                raise ConnectionError("Im WLAN gerade nicht erreichbar.")
+            self.gesendet.append(text)
+            return True
+
+    class DiscordAttrappe:
+        def __init__(self, verbunden=True):
+            self.verbunden = verbunden
+            self.gesendet = []
+            self.gestoppt = False
+
+        def start(self):
+            self.verbunden = True
+
+        def stop(self):
+            self.gestoppt = True
+            self.verbunden = False
+
+        def erreichbar(self, fid):
+            return self.verbunden
+
+        def send_text(self, fid, text):
+            self.gesendet.append(text)
+            return True
+
+    R.pruefe("Jeder Transportweg hat einen Namen für die Oberfläche",
+             all(m in transport.MODUS_NAMEN for m in transport.MODI))
+
+    # Ein Testlauf darf sich unter keinen Umständen mit dem echten Bot in den
+    # echten Kanal hängen - auch dann nicht, wenn Zugangsdaten hinterlegt sind.
+    ereignisse = queue.Queue()
+    echt = discord_transport.DiscordTransport(
+        "AAAA-1111", freunde_a, ereignisse, "irgendein-token", 12345)
+    echt.start()
+    time.sleep(0.3)
+    R.pruefe("Im Testmodus baut der Discord-Transport keine Verbindung auf",
+             not echt.verbunden and echt._thread is None)
+
+    v = transport.ChatVermittler("AAAA-1111", freunde_a, queue.Queue(), modus="beide")
+    v.lan = LanAttrappe(online=["BBBB-2222"])
+    v.discord = DiscordAttrappe()
+
+    R.pruefe("Ist der Freund im WLAN da, wird auch das WLAN genommen",
+             v.erreichbar_ueber("BBBB-2222") == "lan")
+    _, weg = v.send_text_mit_weg("BBBB-2222", "direkt")
+    R.pruefe("Bei 'beide' geht die Nachricht zuerst durchs WLAN",
+             weg == "lan" and v.lan.gesendet == ["direkt"] and not v.discord.gesendet)
+
+    v.lan = LanAttrappe(online=[])          # Freund nicht mehr im Netz
+    R.pruefe("Ohne WLAN bleibt der Weg über Discord",
+             v.erreichbar_ueber("BBBB-2222") == "discord")
+    _, weg = v.send_text_mit_weg("BBBB-2222", "Umweg")
+    R.pruefe("Fällt das WLAN aus, geht dieselbe Nachricht über Discord",
+             weg == "discord" and v.discord.gesendet == ["Umweg"])
+
+    v.modus = "lan"
+    v.discord = DiscordAttrappe()
+    R.pruefe("Im Modus 'lan' gilt ein Freund über Discord nicht als erreichbar",
+             v.erreichbar_ueber("BBBB-2222") is None)
+    R.pruefe("Im Modus 'lan' wird nichts an Discord übergeben",
+             _wirft_fehler(v.send_text, ConnectionError, "BBBB-2222", "geht nicht")
+             and not v.discord.gesendet)
+
+    v.modus = "discord"
+    R.pruefe("Im Modus 'discord' wird der WLAN-Server nicht mehr gebraucht",
+             v.online_ids() == set())
+
+    # Beim Umschalten auf reines WLAN muss die Discord-Verbindung wirklich
+    # zugehen - sonst hinge der Bot im Kanal, obwohl die Oberfläche "aus" sagt.
+    discord_vorher = v.discord
+    v.modus_setzen("lan")
+    R.pruefe("Beim Umschalten auf WLAN wird Discord getrennt",
+             discord_vorher.gestoppt and v.discord is None)
+    R.pruefe("Beim Umschalten auf WLAN läuft der WLAN-Server wieder",
+             v.lan.server_laeuft)
+
+    # --- Der ganze Empfangsweg, nur ohne Netz ------------------------------
+    # Hier läuft dieselbe Verarbeitung wie im Betrieb - _nachricht_verarbeiten()
+    # ist die Methode, die discord.py für jede Nachricht im Kanal aufruft. Nur
+    # der Kanal selbst ist nachgebaut. Damit ist alles geprüft, was VP4 selbst
+    # macht; ungeprüft bleibt allein die Verbindung zu Discord.
+
+    class KanalAttrappe:
+        def __init__(self, id_):
+            self.id = id_
+
+    class AnhangAttrappe:
+        def __init__(self, daten):
+            self._daten = daten
+            self.size = len(daten)
+
+        async def read(self):
+            return self._daten
+
+    class NachrichtAttrappe:
+        def __init__(self, inhalt, kanal_id, anhaenge=()):
+            self.content = inhalt
+            self.channel = KanalAttrappe(kanal_id)
+            self.attachments = list(anhaenge)
+
+    KANAL = 4123041231
+
+    ordner = tempfile.mkdtemp()
+    empfang_vorher = speicher.RECEIVED_DIR
+    speicher.RECEIVED_DIR = Path(ordner)      # echte Dateien nicht anfassen
+    try:
+        q_b = queue.Queue()
+        empfaenger = discord_transport.DiscordTransport(
+            B_ID := "BBBB-2222", freunde_b, q_b, "kein-echter-token", KANAL)
+        sender = DiscordProtokoll("AAAA-1111", freunde_a)
+
+        zeile = sender.zeilen_bauen(B_ID, TESTTEXT.encode("utf-8"))[0]
+        asyncio.run(empfaenger._nachricht_verarbeiten(
+            NachrichtAttrappe(zeile, KANAL)))
+        art, daten = q_b.get_nowait()
+        R.pruefe("Der Empfang meldet die Nachricht an die Oberfläche",
+                 art == "message" and daten["text"] == TESTTEXT,
+                 f"{art}: {daten}")
+        R.pruefe("Die Oberfläche erfährt, dass es über Discord kam",
+                 daten.get("weg") == "discord" and daten.get("encrypted") is True)
+
+        # Ein anderer Kanal desselben Servers geht uns nichts an.
+        asyncio.run(empfaenger._nachricht_verarbeiten(
+            NachrichtAttrappe(zeile, KANAL + 1)))
+        R.pruefe("Nachrichten aus einem anderen Kanal werden übergangen",
+                 q_b.empty())
+
+        # Falscher Schlüssel: früher kam hier ein leerer InvalidTag durch und
+        # die Nachricht verschwand wortlos. Es muss eine Meldung geben.
+        falsche = boese.zeilen_bauen(B_ID, b"angeblich von A")[0]
+        asyncio.run(empfaenger._nachricht_verarbeiten(
+            NachrichtAttrappe(falsche, KANAL)))
+        art, meldung = q_b.get_nowait()
+        R.pruefe("Eine unlesbare Nachricht wird gemeldet statt still verworfen",
+                 art == "error" and "entschlüsselt" in meldung,
+                 f"{art}: {meldung}")
+
+        # --- Eine Datei über Discord --------------------------------------
+        inhalt = os.urandom(50_000)
+        meta = json.dumps({"kind": "bild", "name": "urlaub.png",
+                           "size": len(inhalt)}).encode("utf-8")
+        ankuendigung = sender.zeilen_bauen(
+            B_ID, meta, discord_transport.TYP_DATEI)[0]
+        _, verpackt = chat.payload_verschluesseln(freunde_a, B_ID, inhalt)
+
+        asyncio.run(empfaenger._nachricht_verarbeiten(NachrichtAttrappe(
+            ankuendigung, KANAL, [AnhangAttrappe(verpackt)])))
+        art, daten = q_b.get_nowait()
+        R.pruefe("Eine Datei über Discord kommt an und wird gespeichert",
+                 art == "file" and daten["name"] == "urlaub.png",
+                 f"{art}: {daten}")
+        R.pruefe("Die Datei ist Byte für Byte dieselbe",
+                 art == "file" and Path(daten["path"]).read_bytes() == inhalt)
+        R.pruefe("Der echte Dateiname stand nicht offen im Kanal",
+                 "urlaub" not in ankuendigung)
+
+        # Ankündigung da, Anhang fehlt - das darf nicht still untergehen.
+        ankuendigung = sender.zeilen_bauen(
+            B_ID, meta, discord_transport.TYP_DATEI)[0]
+        asyncio.run(empfaenger._nachricht_verarbeiten(
+            NachrichtAttrappe(ankuendigung, KANAL)))
+        art, meldung = q_b.get_nowait()
+        R.pruefe("Eine Datei ohne Anhang gibt eine Meldung",
+                 art == "error" and "urlaub.png" in meldung, f"{art}: {meldung}")
+    finally:
+        speicher.RECEIVED_DIR = empfang_vorher
+
+    # --- Einstellungen -----------------------------------------------------
+    vorher = discord_transport.discord_config_laden()
+    discord_transport.discord_config_speichern(
+        {"bot_token": "NICHT-SPEICHERN", "kanal_id": "123"})
+    R.pruefe("discord_config_speichern schreibt im Testmodus nichts",
+             discord_transport.discord_config_laden() == vorher,
+             "Der Testlauf hätte die echten Zugangsdaten überschrieben!")
+
+    # --- Der eingebaute Gruppenschlüssel -----------------------------------
+    # Er steckt in der .exe, damit Freunde sofort schreiben können, ohne
+    # vorher etwas auszutauschen. Ein eigener Schlüssel für einen bestimmten
+    # Freund muss ihm trotzdem vorgehen - nur der schützt auch vor den
+    # anderen aus der Gruppe.
+    class GruppenKonfig:
+        BOT_TOKEN = ""
+        KANAL_ID = ""
+        GRUPPEN_SCHLUESSEL = ModernCrypto.generate_aes_key()
+
+    ohne_schluessel_a = TestFreunde({"BBBB-2222": {"nickname": "B"}})
+    ohne_schluessel_b = TestFreunde({"AAAA-1111": {"nickname": "A"}})
+
+    R.pruefe("Ohne eingebauten Gruppenschlüssel bleibt alles wie vorher",
+             chat.gruppen_schluessel_b64() is None
+             and chat.schluessel_fuer(ohne_schluessel_a, "BBBB-2222") == (None, False))
+
+    modul_vorher = sys.modules.get("discord_konfig")
+    try:
+        sys.modules["discord_konfig"] = GruppenKonfig
+
+        R.pruefe("Mit Gruppenschlüssel wird auch ohne eigenen verschlüsselt",
+                 chat.payload_verschluesseln(
+                     ohne_schluessel_a, "BBBB-2222", b"Hallo")[0] is True)
+
+        g_a = DiscordProtokoll("AAAA-1111", ohne_schluessel_a)
+        g_b = DiscordProtokoll("BBBB-2222", ohne_schluessel_b)
+        zeile = g_a.zeilen_bauen("BBBB-2222", TESTTEXT.encode("utf-8"))[0]
+        gelesen = g_b.zeile_lesen(zeile)
+        R.pruefe("Zwei frische Installationen können sofort schreiben",
+                 gelesen is not None and gelesen[2].decode("utf-8") == TESTTEXT,
+                 f"bekommen: {gelesen}")
+        R.pruefe("Der Klartext steht trotzdem nicht im Kanal",
+                 "Straße" not in zeile and "Hallo Leon" not in zeile)
+
+        # Ein eigener Schlüssel muss gewinnen - sonst könnten die anderen aus
+        # der Gruppe weiterhin mitlesen, obwohl man extra einen eingetragen hat.
+        eigener = ModernCrypto.generate_aes_key()
+        mit_eigenem = TestFreunde({"BBBB-2222": {"nickname": "B",
+                                                 "shared_key_b64": eigener}})
+        key, ist_gruppe = chat.schluessel_fuer(mit_eigenem, "BBBB-2222")
+        R.pruefe("Ein eigener Schlüssel geht dem Gruppenschlüssel vor",
+                 key == base64.b64decode(eigener) and ist_gruppe is False)
+
+        privat = DiscordProtokoll("AAAA-1111", mit_eigenem)
+        privat_zeile = privat.zeilen_bauen("BBBB-2222", b"nur fuer B")[0]
+        R.pruefe("Wer nur den Gruppenschlüssel hat, kann das nicht lesen",
+                 _wirft_valueerror(g_b.zeile_lesen, privat_zeile))
+    finally:
+        if modul_vorher is None:
+            sys.modules.pop("discord_konfig", None)
+        else:
+            sys.modules["discord_konfig"] = modul_vorher
+
+    R.pruefe("Nach dem Test ist der Gruppenschlüssel wieder weg",
+             chat.gruppen_schluessel_b64() is None)
+
+    # --- Eingebauter Zugang gegen eigene Eingabe ---------------------------
+    # In der .exe stecken Token und Kanal fest drin, damit Freunde nichts
+    # eintragen müssen. Wer trotzdem etwas einträgt, muss aber gewinnen -
+    # sonst käme man aus einem gesperrten eingebauten Bot nie wieder heraus.
+    import discord_konfig
+
+    R.pruefe("Im Quelltext steht kein echter Bot-Token",
+             not discord_konfig.BOT_TOKEN.strip()
+             and not str(discord_konfig.KANAL_ID).strip(),
+             "discord_konfig.py darf nur leere Platzhalter enthalten - die "
+             "echten Werte setzt der Bau-Workflow ein!")
+
+    class KonfigAttrappe:
+        BOT_TOKEN = "eingebaut-token"
+        KANAL_ID = "111111111111111111"
+
+    datei_vorher = discord_transport.DISCORD_CONFIG_FILE
+    modul_vorher = sys.modules.get("discord_konfig")
+    with tempfile.TemporaryDirectory() as ordner:
+        try:
+            sys.modules["discord_konfig"] = KonfigAttrappe
+            discord_transport.DISCORD_CONFIG_FILE = Path(ordner) / "discord.json"
+
+            cfg = discord_transport.discord_config_laden()
+            R.pruefe("Ohne eigene Eingabe gilt der eingebaute Zugang",
+                     cfg["bot_token"] == "eingebaut-token"
+                     and cfg["kanal_id"] == "111111111111111111", str(cfg))
+            R.pruefe("Mit eingebautem Zugang gilt Discord als eingerichtet",
+                     discord_transport.ist_eingerichtet())
+
+            speicher.save_json(discord_transport.DISCORD_CONFIG_FILE,
+                               {"bot_token": "eigener-token", "kanal_id": ""})
+            cfg = discord_transport.discord_config_laden()
+            R.pruefe("Ein eigener Token schlägt den eingebauten",
+                     cfg["bot_token"] == "eigener-token", str(cfg))
+            R.pruefe("Ein leer gelassenes Feld löscht den eingebauten Wert nicht",
+                     cfg["kanal_id"] == "111111111111111111", str(cfg))
+        finally:
+            discord_transport.DISCORD_CONFIG_FILE = datei_vorher
+            if modul_vorher is None:
+                sys.modules.pop("discord_konfig", None)
+            else:
+                sys.modules["discord_konfig"] = modul_vorher
+
+
+def test_gruppen():
+    """Gruppen: Code erzeugen, beitreten, schreiben - und wer draußen bleibt."""
+    print("\n=== Gruppen ===")
+
+    import discord_transport
+    import transport
+    from discord_transport import DiscordProtokoll
+    from speicher import GruppenStore
+
+    class TestFreunde:
+        def __init__(self, eintraege=None):
+            self._d = dict(eintraege or {})
+
+        def __contains__(self, fid):
+            return fid in self._d
+
+        def get(self, fid):
+            return self._d.get(fid)
+
+        def all(self):
+            return dict(self._d)
+
+    with tempfile.TemporaryDirectory() as ordner:
+        a_gruppen = GruppenStore(Path(ordner) / "a.json")
+        b_gruppen = GruppenStore(Path(ordner) / "b.json")
+        fremd_gruppen = GruppenStore(Path(ordner) / "fremd.json")
+
+        gid = a_gruppen.erstellen("Die Jungs")
+        R.pruefe("Eine neue Gruppe bekommt eine Kennung der Form G-XXXX",
+                 speicher.ist_gruppen_id(gid) and len(gid) == 10, gid)
+        R.pruefe("Eine Freundes-ID wird nicht für eine Gruppe gehalten",
+                 not speicher.ist_gruppen_id("ABCD-1234"))
+        R.pruefe("Die Gruppe hat einen eigenen Schlüssel",
+                 len(base64.b64decode(a_gruppen.get(gid)["key_b64"])) == 32)
+        R.pruefe("Der Name bleibt erhalten",
+                 a_gruppen.get(gid)["name"] == "Die Jungs")
+
+        code = a_gruppen.code(gid)
+        R.pruefe("Der Einladungscode ist am Anfang erkennbar",
+                 code.startswith("VP4G1-"), code[:12])
+        R.pruefe("Der Code enthält den Namen der Gruppe nicht",
+                 "Jungs" not in code)
+        R.pruefe("Der Code passt in eine Zeile", len(code) <= 70,
+                 f"{len(code)} Zeichen")
+
+        # --- Beitreten ------------------------------------------------------
+        gid_b = b_gruppen.beitreten(code, "Jungs")
+        R.pruefe("Wer beitritt, landet in derselben Gruppe", gid_b == gid)
+        R.pruefe("Beide haben denselben Schlüssel",
+                 b_gruppen.get(gid)["key_b64"] == a_gruppen.get(gid)["key_b64"])
+        R.pruefe("Der eigene Name für die Gruppe darf abweichen",
+                 b_gruppen.get(gid)["name"] == "Jungs")
+
+        R.pruefe("Ein abgeschnittener Code wird abgelehnt",
+                 _wirft_valueerror(b_gruppen.beitreten, code[:20]))
+        R.pruefe("Irgendein Text wird abgelehnt",
+                 _wirft_valueerror(b_gruppen.beitreten, "hallo ich bin ein code"))
+        R.pruefe("Ein leerer Code wird abgelehnt",
+                 _wirft_valueerror(b_gruppen.beitreten, ""))
+
+        # --- Schreiben ------------------------------------------------------
+        # A und B kennen sich NICHT als Freunde - in einer Gruppe zählt nur
+        # der Code. Genau das soll gehen.
+        a = DiscordProtokoll("AAAA-1111", TestFreunde(), a_gruppen)
+        b = DiscordProtokoll("BBBB-2222", TestFreunde(), b_gruppen)
+        fremd = DiscordProtokoll("CCCC-3333", TestFreunde(), fremd_gruppen)
+
+        zeilen = a.zeilen_bauen(gid, TESTTEXT.encode("utf-8"))
+        gelesen = b.zeile_lesen(zeilen[0])
+        R.pruefe("In der Gruppe kommt die Nachricht an, ohne Freundschaft",
+                 gelesen is not None and gelesen[2].decode("utf-8") == TESTTEXT,
+                 f"bekommen: {gelesen}")
+        R.pruefe("Die Nachricht ist als Gruppennachricht erkennbar",
+                 gelesen is not None and gelesen[3] == gid)
+        R.pruefe("Der Absender steht dabei", gelesen is not None
+                 and gelesen[0] == "AAAA-1111")
+        R.pruefe("Der eigene Beitrag kommt nicht als fremder zurück",
+                 a.zeile_lesen(zeilen[0]) is None)
+
+        R.pruefe("Wer nicht in der Gruppe ist, sieht die Zeile gar nicht an",
+                 fremd.zeile_lesen(zeilen[0]) is None)
+
+        # Wer beitritt, kann auch Älteres lesen, das noch im Kanal steht -
+        # das steht so im Warnhinweis und muss auch stimmen.
+        fremd_gruppen.beitreten(code)
+        spaeter = DiscordProtokoll("CCCC-3333", TestFreunde(), fremd_gruppen)
+        gelesen = spaeter.zeile_lesen(a.zeilen_bauen(gid, b"Nachzuegler")[0])
+        R.pruefe("Wer den Code bekommt, ist sofort dabei",
+                 gelesen is not None and gelesen[2] == b"Nachzuegler")
+
+        # --- Verlassen ------------------------------------------------------
+        fremd_gruppen.verlassen(gid)
+        raus = DiscordProtokoll("CCCC-3333", TestFreunde(), fremd_gruppen)
+        R.pruefe("Nach dem Verlassen kommt nichts mehr an",
+                 raus.zeile_lesen(a.zeilen_bauen(gid, b"geheim")[0]) is None)
+        R.pruefe("Der Code einer verlassenen Gruppe lässt sich nicht mehr holen",
+                 _wirft_valueerror(fremd_gruppen.code, gid))
+
+        # --- Der Weg: Gruppen gehen nur über Discord ------------------------
+        class LanAttrappe:
+            server_laeuft = False
+            chat_port = 41230
+            broadcast_port = 41231
+
+            def start(self):
+                self.server_laeuft = True
+
+            def stop(self):
+                self.server_laeuft = False
+
+            def online_ids(self):
+                return set()
+
+            def is_online(self, fid):
+                return True          # behauptet, jeden zu kennen
+
+            def send_text(self, fid, text):
+                raise AssertionError("Eine Gruppe darf nie ins WLAN gehen!")
+
+        class DiscordAttrappe:
+            verbunden = True
+
+            def __init__(self):
+                self.gesendet = []
+
+            def erreichbar(self, fid):
+                return True
+
+            def send_text(self, fid, text):
+                self.gesendet.append((fid, text))
+                return True
+
+        v = transport.ChatVermittler("AAAA-1111", TestFreunde(), queue.Queue(),
+                                     modus="beide", gruppen=a_gruppen)
+        v.lan = LanAttrappe()
+        v.discord = DiscordAttrappe()
+
+        _, weg = v.send_text_mit_weg(gid, "an alle")
+        R.pruefe("Eine Gruppennachricht geht über Discord, nie ins WLAN",
+                 weg == "discord" and v.discord.gesendet == [(gid, "an alle")])
+        R.pruefe("Eine Gruppe gilt als erreichbar, sobald Discord verbunden ist",
+                 v.erreichbar_ueber(gid) == "discord")
+
+        v.discord = None
+        R.pruefe("Ohne Discord ist eine Gruppe nicht erreichbar",
+                 v.erreichbar_ueber(gid) is None)
+        R.pruefe("Ohne Discord scheitert das Senden mit einer Erklärung",
+                 _wirft_fehler(v.send_text, ConnectionError, gid, "geht nicht"))
+
+        # --- Namen in Gruppen ----------------------------------------------
+        # In einer Gruppe hat niemand den anderen als Freund hinterlegt.
+        # Ohne mitgeschickten Namen stünde dort nur die ID.
+        class KanalAttrappe0:
+            def __init__(self, id_):
+                self.id = id_
+
+        class NachrichtAttrappe0:
+            def __init__(self, inhalt, kanal_id):
+                self.content = inhalt
+                self.channel = KanalAttrappe0(kanal_id)
+                self.attachments = []
+
+        KANAL0 = 4123041231
+        q_a, q_b = queue.Queue(), queue.Queue()
+        sender = discord_transport.DiscordTransport(
+            "MAXX-0002", TestFreunde(), q_a, "kein-echter-token", KANAL0,
+            gruppen=b_gruppen, anzeigename="Max")
+        leser = discord_transport.DiscordTransport(
+            "LEON-0001", TestFreunde(), q_b, "kein-echter-token", KANAL0,
+            gruppen=a_gruppen)
+
+        zeile = sender.protokoll.zeilen_bauen(
+            gid, json.dumps({"n": "Max", "t": "bin dabei"}).encode("utf-8"),
+            discord_transport.TYP_GRUPPENTEXT)[0]
+        asyncio.run(leser._nachricht_verarbeiten(NachrichtAttrappe0(zeile, KANAL0)))
+        art, daten = q_b.get_nowait()
+        R.pruefe("In der Gruppe kommt der Name des Absenders mit",
+                 art == "message" and daten.get("name") == "Max"
+                 and daten["text"] == "bin dabei", f"{art}: {daten}")
+        R.pruefe("Der Text enthält den Namen nicht mehr",
+                 daten["text"] == "bin dabei")
+
+        # Ein kaputter Gruppentext darf den Empfang nicht anhalten.
+        kaputt = sender.protokoll.zeilen_bauen(
+            gid, b"das ist kein JSON", discord_transport.TYP_GRUPPENTEXT)[0]
+        asyncio.run(leser._nachricht_verarbeiten(NachrichtAttrappe0(kaputt, KANAL0)))
+        art, daten = q_b.get_nowait()
+        R.pruefe("Ein unlesbarer Gruppentext kommt trotzdem an",
+                 art == "message" and daten.get("name") is None, f"{art}: {daten}")
+
+        # --- Empfang bis in die Oberfläche ---------------------------------
+        class KanalAttrappe:
+            def __init__(self, id_):
+                self.id = id_
+
+        class NachrichtAttrappe:
+            def __init__(self, inhalt, kanal_id):
+                self.content = inhalt
+                self.channel = KanalAttrappe(kanal_id)
+                self.attachments = []
+
+        KANAL = 4123041231
+        q_b = queue.Queue()
+        empfaenger = discord_transport.DiscordTransport(
+            "BBBB-2222", TestFreunde(), q_b, "kein-echter-token", KANAL,
+            gruppen=b_gruppen)
+        asyncio.run(empfaenger._nachricht_verarbeiten(NachrichtAttrappe(
+            a.zeilen_bauen(gid, "Treffen um 8?".encode("utf-8"))[0], KANAL)))
+        art, daten = q_b.get_nowait()
+        R.pruefe("Die Oberfläche bekommt die Gruppennachricht mit Gruppenangabe",
+                 art == "message" and daten.get("gruppe") == gid
+                 and daten["text"] == "Treffen um 8?", f"{art}: {daten}")
+
+
 def test_verfahrensliste():
     print("\n=== Verfahrensliste (davon lebt die Auswahl in der Oberfläche) ===")
     R.pruefe(f"Es sind {len(VERFAHREN)} Verfahren eingetragen", len(VERFAHREN) >= 13)
@@ -1075,6 +1707,30 @@ def test_oberflaeche():
                 fenster._verfahren_gewechselt(verfahren)
                 fenster.update()
             R.pruefe("Alle Verfahren lassen sich in der Auswahl durchschalten", True)
+
+            # Die Überschrift der Chatseite muss sagen, wo die Nachrichten
+            # wirklich langlaufen - sie stand vorher fest auf "Chat im WLAN",
+            # auch wenn alles über Discord ging.
+            fenster._seite_zeigen("chat")
+            fenster.update()
+            R.pruefe("Voreingestellt ist 'beide', und die Chatseite sagt das auch",
+                     speicher.STANDARD_EINSTELLUNGEN["transport_modus"] == "beide"
+                     and fenster.chat_ueberschrift.cget("text") == "Chat",
+                     f"da steht: {fenster.chat_ueberschrift.cget('text')}")
+
+            # Bei "beide" sucht sich VP4 den Weg selbst - dann steht dort
+            # schlicht "Chat". Nur ein festgelegter Weg wird benannt.
+            for modus, erwartet in (("discord", "Chat über Discord"),
+                                    ("beide", "Chat"),
+                                    ("lan", "Chat im WLAN")):
+                fenster.config_data["transport_modus"] = modus
+                fenster._seite_zeigen("einstellungen")
+                fenster.update()
+                fenster._transport_gewaehlt(gui.transport.MODUS_NAMEN[modus])
+                fenster.update()
+                R.pruefe(f"Der Transportweg '{modus}' steht in der Überschrift",
+                         fenster.chat_ueberschrift.cget("text") == erwartet,
+                         f"da steht: {fenster.chat_ueberschrift.cget('text')}")
 
             # Wirklich einmal verschlüsseln, so wie ein Klick es täte
             fenster.verfahren_wahl.set("AES-256-GCM")
@@ -1179,6 +1835,21 @@ def test_oberflaeche():
             R.pruefe("Der Farbwechsel häuft keine Zeitgeber an",
                      len(fenster._zeitgeber) == 2, f"offen: {fenster._zeitgeber}")
 
+            # Ein gelaufener Auftrag muss sich selbst wieder austragen. Ohne
+            # das wuchs die Liste im Betrieb um einen toten Eintrag alle
+            # 300 ms - und die Zählung oben ging mal auf und mal nicht.
+            vorher = len(fenster._zeitgeber)
+            fenster._spaeter(1, lambda: None)
+            R.pruefe("Ein angemeldeter Zeitgeber steht in der Liste",
+                     len(fenster._zeitgeber) == vorher + 1)
+            zeitende = time.time() + 2
+            while len(fenster._zeitgeber) > vorher and time.time() < zeitende:
+                fenster.update()
+                time.sleep(0.01)
+            R.pruefe("Ein gelaufener Zeitgeber trägt sich wieder aus",
+                     len(fenster._zeitgeber) == vorher,
+                     f"offen: {fenster._zeitgeber}")
+
             # Mehrmals hintereinander muss genauso gehen.
             for farbe in ("Orange", "Rot", "Blau"):
                 fenster._farbe_gewaehlt(farbe)
@@ -1216,6 +1887,8 @@ def main():
     test_dateien()
     test_obsidian()
     test_chat()
+    test_discord()
+    test_gruppen()
     test_verfahrensliste()
     test_oberflaeche()
 

@@ -50,6 +50,8 @@ import time
 import uuid
 from pathlib import Path
 
+from cryptography.exceptions import InvalidTag
+
 from krypto import ModernCrypto
 import speicher
 
@@ -68,6 +70,116 @@ MSG_HELLO = 0
 MSG_TEXT = 1
 MSG_META = 2
 MSG_DATA = 3
+
+
+# =============================================================================
+#  Gemeinsame Bausteine für alle Transportwege
+# =============================================================================
+# Diese drei Funktionen hängen an nichts als der Freundesliste - kein Socket,
+# kein Discord, keine Oberflaeche. Genau deshalb stehen sie hier auf Modulebene
+# und nicht in ChatNetwork: der Discord-Transport benutzt woertlich dieselben.
+# Wären es zwei Kopien, wuerde eine davon irgendwann anders verschluesseln als
+# die andere, und der Fehler faellt erst auf, wenn eine Nachricht nicht mehr
+# ankommt.
+
+def gruppen_schluessel_b64():
+    """Der Schlüssel, den alle mit derselben VP4.exe teilen - oder None.
+
+    Er wird beim Bauen der .exe eingesetzt (discord_konfig.py). Sein Zweck ist
+    Bequemlichkeit: Freunde sollen sofort schreiben können, ohne vorher einen
+    Schlüssel auszutauschen.
+
+    WAS ER LEISTET UND WAS NICHT
+    -----------------------------
+    Gegen Discord und gegen jeden Fremden im Server schützt er wie jeder
+    andere AES-256-Schlüssel. Untereinander schützt er NICHT: Wer dieselbe
+    .exe hat, kann alles im Kanal mitlesen, auch Nachrichten zwischen zwei
+    anderen. Er ist ein Gruppenschlüssel, kein Schlüssel pro Freundschaft.
+
+    Ein Schlüssel, der für einen bestimmten Freund hinterlegt ist, geht ihm
+    deshalb immer vor - nur der schützt auch vor den anderen aus der Gruppe.
+    """
+    try:
+        import discord_konfig
+    except ImportError:
+        return None
+    return (getattr(discord_konfig, "GRUPPEN_SCHLUESSEL", "") or "").strip() or None
+
+
+def schluessel_fuer(friends, ziel_id: str, gruppen=None):
+    """Der Schlüssel für dieses Ziel.
+
+    Die Reihenfolge ist die Rangfolge:
+
+    1. Ist das Ziel eine **Gruppe**, gilt ihr Schlüssel - alle Mitglieder
+       haben denselben, sonst wäre es keine Gruppe.
+    2. Sonst ein Schlüssel, der für **diesen Freund** hinterlegt ist. Nur
+       der schützt auch vor den anderen mit derselben VP4.exe.
+    3. Sonst der eingebaute **Gruppenschlüssel** aus der .exe.
+
+    Rückgabe: (schluessel oder None, ist_gemeinschaftlich)
+    """
+    if speicher.ist_gruppen_id(ziel_id):
+        gruppe = gruppen.get(ziel_id) if gruppen is not None else None
+        if gruppe and gruppe.get("key_b64"):
+            return base64.b64decode(gruppe["key_b64"]), True
+        return None, False
+
+    freund = friends.get(ziel_id)
+    if freund and freund.get("shared_key_b64"):
+        return base64.b64decode(freund["shared_key_b64"]), False
+    eingebaut = gruppen_schluessel_b64()
+    if eingebaut:
+        return base64.b64decode(eingebaut), True
+    return None, False
+
+
+def payload_verschluesseln(friends, friend_id: str, payload: bytes, gruppen=None):
+    """Verschlüsselt, wenn für das Ziel ein gemeinsamer Schlüssel da ist.
+
+    Rückgabe: (wurde_verschlüsselt, daten)
+    """
+    key, _gemeinsam = schluessel_fuer(friends, friend_id, gruppen)
+    if key is not None:
+        return True, ModernCrypto.aes_encrypt_bytes(payload, key)
+    return False, payload
+
+
+def payload_entschluesseln(friends, friend_id: str, verschluesselt: bool,
+                           payload: bytes, gruppen=None) -> bytes:
+    """Gegenstück zu payload_verschluesseln().
+
+    Löst ValueError aus, wenn etwas verschlüsselt ankommt, aber kein
+    gemeinsamer Schlüssel hinterlegt ist.
+    """
+    if verschluesselt:
+        key, _gemeinsam = schluessel_fuer(friends, friend_id, gruppen)
+        if key is None:
+            raise ValueError("Verschlüsselt, aber kein gemeinsamer Schlüssel hinterlegt.")
+        try:
+            return ModernCrypto.aes_decrypt_bytes(payload, key)
+        except InvalidTag:
+            # AES-GCM meldet einen falschen Schlüssel oder veränderte Daten mit
+            # einem leeren InvalidTag - ein Fehler ohne Text. Hier wird ein
+            # ValueError mit Erklärung daraus, denn genau danach unterscheidet
+            # der Discord-Empfang: ValueError heißt "war für uns, ging aber
+            # nicht auf" und wird gemeldet, alles andere fliegt still raus.
+            raise ValueError(
+                "Die Nachricht ließ sich nicht entschlüsseln - der gemeinsame "
+                "Schlüssel passt nicht.")
+    return payload
+
+
+def zieldatei(name: str) -> Path:
+    """Baut einen Pfad im Empfangsordner, der nichts überschreiben kann.
+
+    Path(...).name wirft dabei alle Verzeichnisangaben weg. Ohne das könnte
+    ein Absender einen Dateinamen mit Punkt-Punkt-Schritten nach oben
+    schicken und damit aus dem Empfangsordner ausbrechen.
+    """
+    sicher = f"{int(time.time())}_{uuid.uuid4().hex[:8]}_{Path(name or 'datei').name}"
+    speicher.ordner_anlegen()
+    return speicher.RECEIVED_DIR / sicher
 
 
 class ChatNetwork:
@@ -335,10 +447,7 @@ class ChatNetwork:
                 "Eine verschlüsselte Datei war zu groß - Verbindung getrennt."))
             return False
 
-        sicherer_name = (f"{int(time.time())}_{uuid.uuid4().hex[:8]}_"
-                         f"{Path(meta.get('name') or 'datei').name}")
-        ziel = speicher.RECEIVED_DIR / sicherer_name
-        speicher.ordner_anlegen()
+        ziel = zieldatei(meta.get("name"))
 
         try:
             if flags & 1:
@@ -376,7 +485,7 @@ class ChatNetwork:
 
         self.events.put(("file", {"from": friend_id, "path": str(ziel),
                                   "kind": meta.get("kind", "file"),
-                                  "name": meta.get("name", sicherer_name)}))
+                                  "name": meta.get("name", ziel.name)}))
         return True
 
     # -------------------------------------------------------------- Senden
@@ -471,20 +580,10 @@ class ChatNetwork:
     # ------------------------------------------ Ver-/Entschlüsseln der Daten
 
     def _maybe_encrypt(self, friend_id: str, payload: bytes):
-        freund = self.friends.get(friend_id)
-        if freund and freund.get("shared_key_b64"):
-            key = base64.b64decode(freund["shared_key_b64"])
-            return True, ModernCrypto.aes_encrypt_bytes(payload, key)
-        return False, payload
+        return payload_verschluesseln(self.friends, friend_id, payload)
 
     def _maybe_decrypt(self, friend_id: str, flags: int, payload: bytes) -> bytes:
-        if flags & 1:
-            freund = self.friends.get(friend_id)
-            if not freund or not freund.get("shared_key_b64"):
-                raise ValueError("Verschlüsselt, aber kein gemeinsamer Schlüssel hinterlegt.")
-            key = base64.b64decode(freund["shared_key_b64"])
-            return ModernCrypto.aes_decrypt_bytes(payload, key)
-        return payload
+        return payload_entschluesseln(self.friends, friend_id, bool(flags & 1), payload)
 
     # --------------------------------------------------------- Datenrahmen
 

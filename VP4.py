@@ -20,9 +20,18 @@ Was das Programm kann:
      dort wieder einlesen
   6) Im eigenen WLAN chatten und Bilder/Videos schicken - direkt
      zwischen den Rechnern, ohne Server und ohne Internet
+  7) Wahlweise über einen Discord-Kanal chatten, wenn der Freund nicht
+     im selben WLAN sitzt. Verschlüsselt wird genauso; Discord bekommt
+     nur den Geheimtext zu sehen. Dafür braucht es zusätzlich
+     "pip install discord.py" - ohne das Paket läuft alles andere
+     weiter, nur dieser eine Weg nicht.
+  8) Gruppen: eine aufmachen, den Code weitergeben, und alle, die ihn
+     haben, schreiben miteinander - ohne dass sich jemand vorher
+     kennen muss.
 
-Alles läuft auf deinem Rechner. Es werden keine Daten ins Internet
-geschickt, und es wird zur Laufzeit keine KI gebraucht.
+Ver- und Entschlüsseln passiert vollständig auf deinem Rechner, und
+zur Laufzeit wird keine KI gebraucht. Ins Internet geht nur, was du
+selbst über den Chat verschickst - und auch das nur verschlüsselt.
 
 
 DIE DATEIEN
@@ -33,6 +42,9 @@ DIE DATEIEN
   dateien.py    Dateien und Ordner als .vp4-Container
   speicher.py   Schlüsselspeicher, Einstellungen, Obsidian
   chat.py       der LAN-Chat
+  transport.py  wählt den Weg: WLAN, Discord oder beides
+  discord_transport.py   der Chat über einen Discord-Kanal
+  discord_konfig.py      Platzhalter für den eingebauten Bot-Zugang
   test_vp4.py   Selbsttest - nach Änderungen ausführen!
 
 Die Aufteilung gibt es, weil alles zusammen in einer Datei bei über
@@ -44,6 +56,7 @@ VORAUSSETZUNGEN
 ----------------
   - Python 3.9 oder neuer
   - Einmalig installieren:   pip install cryptography argon2-cffi customtkinter
+  - Für den Chat über Discord zusätzlich:   pip install discord.py
 
 
 EINE .EXE DARAUS MACHEN (damit Freunde kein Python brauchen)
@@ -68,10 +81,16 @@ WICHTIG - EHRLICHE HINWEISE
    sind zum Ausprobieren da. In der App steht das an jedem Verfahren.
  - Beim Export nach Obsidian stehen die Schlüssel im Klartext in der
    Notiz. Wird der Vault synchronisiert, werden sie mitsynchronisiert.
- - Der Chat verschlüsselt nur, wenn für den Freund ein gemeinsamer
-   Schlüssel hinterlegt ist. Und: beim Verbindungsaufbau wird nur
-   behauptet, wer man ist - nachgeprüft wird es nicht. Wer im selben
-   WLAN ist, könnte sich als ein Freund ausgeben.
+ - Der Chat benutzt, wenn nichts anderes eingetragen ist, den in die
+   .exe eingebauten Schlüssel. Der schützt gegen Discord und gegen
+   Fremde, aber nicht untereinander: Wer dieselbe .exe hat, kann alles
+   im Kanal mitlesen. Für ein Gespräch unter vier Augen trägt man für
+   den Freund einen eigenen Schlüssel ein.
+ - Dasselbe gilt für Gruppen: Wer den Einladungscode hat, liest mit -
+   auch Älteres, das noch im Kanal steht.
+ - Beim Verbindungsaufbau wird nur behauptet, wer man ist - nachgeprüft
+   wird es nicht. Wer im selben WLAN oder im selben Discord-Kanal ist,
+   könnte sich als ein Freund ausgeben.
 =====================================================================
 """
 

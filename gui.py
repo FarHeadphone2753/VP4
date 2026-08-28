@@ -31,9 +31,12 @@ from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
+import chat
 import dateien
+import discord_transport
 import speicher
-from chat import ChatNetwork
+import transport
+from transport import ChatVermittler
 from krypto import (VERFAHREN, SCHLUESSEL_ARTEN, ClassicCiphers, ModernCrypto,
                     Pruefsummen, Signaturen)
 from speicher import (FalschesPasswortError, FriendsStore, KeyStore,
@@ -336,8 +339,14 @@ class VP4App(ctk.CTk):
         self.my_id = config["my_id"]
 
         self.friends = FriendsStore(speicher.FRIENDS_FILE)
+        self.gruppen = speicher.GruppenStore(speicher.GROUPS_FILE)
         self.ereignisse = queue.Queue()
-        self.network = ChatNetwork(self.my_id, self.friends, self.ereignisse)
+        self.network = ChatVermittler(
+            self.my_id, self.friends, self.ereignisse,
+            modus=config.get("transport_modus", "lan"),
+            discord_cfg=discord_transport.discord_config_laden(),
+            gruppen=self.gruppen,
+            anzeigename=config.get("anzeigename", ""))
         self.chat_verlauf = {}          # {freund_id: [zeilen]}
         self.aktiver_chat = None
         self.seiten = {}
@@ -378,8 +387,25 @@ class VP4App(ctk.CTk):
         self._spaeter(1500, self._freunde_aktualisieren)
 
     def _spaeter(self, ms, funktion):
-        """Wie after(), merkt sich den Auftrag aber zum Abbestellen."""
-        kennung = self.after(ms, funktion)
+        """Wie after(), merkt sich den Auftrag aber zum Abbestellen.
+
+        Ein gelaufener Auftrag trägt sich selbst wieder aus. Ohne das stand
+        seine Kennung für immer in der Liste, obwohl es nichts mehr
+        abzubestellen gab: Die Ereignisschleife meldet sich alle 300 ms neu
+        an, das sind rund 12.000 tote Einträge pro Stunde. Aufgefallen ist es
+        an einem Test, der mal durchlief und mal nicht - je nachdem, ob
+        zufällig gerade ein Zeitgeber gefeuert hatte.
+        """
+        kennung = None
+
+        def ausfuehren():
+            try:
+                self._zeitgeber.remove(kennung)
+            except ValueError:
+                pass
+            funktion()
+
+        kennung = self.after(ms, ausfuehren)
         self._zeitgeber.append(kennung)
         return kennung
 
@@ -1530,8 +1556,13 @@ class VP4App(ctk.CTk):
 
         kopf = ctk.CTkFrame(seite, fg_color="transparent")
         kopf.grid(row=0, column=0, columnspan=2, sticky="ew", padx=26, pady=(22, 8))
-        ctk.CTkLabel(kopf, text="Chat im WLAN", font=schrift(22, True),
-                     text_color=FARBE["text"]).pack(side="left")
+        # Die Überschrift sagt, wo die Nachrichten wirklich langlaufen. "Chat
+        # im WLAN" stand vorher auch dann da, wenn alles über Discord ging -
+        # das ist genau die Angabe, bei der man sich darauf verlässt.
+        self.chat_ueberschrift = ctk.CTkLabel(
+            kopf, text=self._chat_ueberschrift_text(), font=schrift(22, True),
+            text_color=FARBE["text"])
+        self.chat_ueberschrift.pack(side="left")
 
         id_kasten = ctk.CTkFrame(kopf, fg_color=FARBE["flaeche_tief"], corner_radius=RADIUS)
         id_kasten.pack(side="right")
@@ -1553,7 +1584,7 @@ class VP4App(ctk.CTk):
         links.grid_propagate(False)
         links.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(links, text="Freunde", font=schrift(12, True),
+        ctk.CTkLabel(links, text="Freunde & Gruppen", font=schrift(12, True),
                      text_color=FARBE["text_leise"]).grid(row=0, column=0, sticky="w",
                                                           padx=14, pady=(12, 6))
         self.freunde_liste = ctk.CTkScrollableFrame(links, fg_color="transparent",
@@ -1575,7 +1606,18 @@ class VP4App(ctk.CTk):
                       font=schrift(11), fg_color="transparent", border_width=1,
                       border_color=FARBE["rand"], text_color=FARBE["schlecht"],
                       hover_color=FARBE["flaeche"],
-                      command=self._freund_entfernen).pack(side="left")
+                      command=self._eintrag_entfernen).pack(side="left")
+
+        # Zweite Reihe: Gruppen. Eine Gruppe ist kein Freund - sie hat keine
+        # ID zum Hinzufügen, sondern einen Code zum Weitergeben.
+        gruppen_knoepfe = ctk.CTkFrame(links, fg_color="transparent")
+        gruppen_knoepfe.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 12))
+        knopf(gruppen_knoepfe, "＋ Gruppe", self._gruppe_erstellen,
+              art="leise", hoehe=32, breite=90).pack(side="left", expand=True, fill="x")
+        knopf(gruppen_knoepfe, "Beitreten", self._gruppe_beitreten,
+              art="leise", hoehe=32, breite=90).pack(side="left", expand=True, fill="x", padx=4)
+        knopf(gruppen_knoepfe, "Code", self._gruppen_code_zeigen,
+              art="leise", hoehe=32, breite=52).pack(side="left")
 
         # --- Chatfenster rechts --------------------------------------------
         rechts = ctk.CTkFrame(seite, fg_color="transparent")
@@ -1625,18 +1667,22 @@ class VP4App(ctk.CTk):
             for kind in self.freunde_liste.winfo_children():
                 kind.destroy()
 
-            online = self.network.online_ids()
             for fid, daten in sorted(self.friends.all().items()):
                 name = daten.get("nickname") or fid
-                ist_online = fid in online
-                hat_schluessel = bool(daten.get("shared_key_b64"))
+                weg = self.network.erreichbar_ueber(fid)
 
                 zeile = ctk.CTkFrame(self.freunde_liste, fg_color="transparent")
                 zeile.pack(fill="x", pady=1)
 
-                text = f"{'🟢' if ist_online else '⚪'}  {name}"
-                if hat_schluessel:
+                # 🟢 direkt im WLAN, 🌐 nur über Discord, ⚪ gar nicht
+                zeichen = {"lan": "🟢", "discord": "🌐"}.get(weg, "⚪")
+                text = f"{zeichen}  {name}"
+                # 🔒 eigener Schlüssel (nur ihr zwei), 👥 Gruppenschlüssel
+                # (alle mit VP4 können mitlesen), nichts = im Klartext.
+                if daten.get("shared_key_b64"):
                     text += "  🔒"
+                elif chat.gruppen_schluessel_b64():
+                    text += "  👥"
                 knopf = ctk.CTkButton(
                     zeile, text=text, anchor="w", height=36, corner_radius=8,
                     font=schrift(12),
@@ -1646,10 +1692,29 @@ class VP4App(ctk.CTk):
                     command=lambda f=fid: self._chat_oeffnen(f))
                 knopf.pack(fill="x")
 
-            if not self.friends.all():
+            # Gruppen stehen unter den Freunden in derselben Liste - für den
+            # Chat ist beides dasselbe: etwas, dem man schreibt.
+            for gid, gruppe in sorted(self.gruppen.all().items(),
+                                      key=lambda p: (p[1].get("name") or "").lower()):
+                zeile = ctk.CTkFrame(self.freunde_liste, fg_color="transparent")
+                zeile.pack(fill="x", pady=1)
+                erreichbar = self.network.erreichbar_ueber(gid) is not None
+                text = f"{'👥' if erreichbar else '⚪'}  {gruppe.get('name') or gid}"
+                ctk.CTkButton(
+                    zeile, text=text, anchor="w", height=36, corner_radius=8,
+                    font=schrift(12),
+                    fg_color=FARBE["akzent"] if gid == self.aktiver_chat else "transparent",
+                    text_color="#ffffff" if gid == self.aktiver_chat else FARBE["text"],
+                    hover_color=FARBE["flaeche"],
+                    command=lambda g=gid: self._chat_oeffnen(g)).pack(fill="x")
+
+            if not self.friends.all() and not self.gruppen.all():
+                wo = ("jemandem im selben WLAN."
+                      if self.config_data.get("transport_modus", "lan") == "lan"
+                      else "einem Freund – egal wo er gerade ist.")
                 ctk.CTkLabel(self.freunde_liste,
-                             text="Noch keine Freunde.\n\nTausche deine ID mit\n"
-                                  "jemandem im selben WLAN.",
+                             text=f"Noch niemand da.\n\nTausche deine ID mit\n{wo}\n\n"
+                                  f"Oder mach eine Gruppe auf und\nschick den Code herum.",
                              font=schrift(11), text_color=FARBE["text_leise"],
                              justify="center").pack(pady=30)
 
@@ -1657,9 +1722,28 @@ class VP4App(ctk.CTk):
 
     def _chat_oeffnen(self, fid):
         self.aktiver_chat = fid
+
+        if speicher.ist_gruppen_id(fid):
+            gruppe = self.gruppen.get(fid) or {}
+            name = gruppe.get("name") or fid
+            self.chat_titel.configure(
+                text=f"👥 {name}   ·   {fid}   ·   "
+                     f"🔒 Gruppe – alle mit dem Code lesen mit")
+            self._chat_verlauf_zeichnen(fid)
+            return
+
         daten = self.friends.get(fid) or {}
         name = daten.get("nickname") or fid
-        gesichert = "🔒 verschlüsselt" if daten.get("shared_key_b64") else "🔓 unverschlüsselt"
+        # Beim Gruppenschlüssel steht ausdrücklich etwas anderes da als bei
+        # einem eigenen: er schützt vor Discord und vor Fremden, aber nicht
+        # vor den anderen mit derselben VP4.exe. "🔒 verschlüsselt" würde
+        # hier mehr versprechen, als er hält.
+        if daten.get("shared_key_b64"):
+            gesichert = "🔒 verschlüsselt"
+        elif chat.gruppen_schluessel_b64():
+            gesichert = "🔒 Gruppenschlüssel (alle mit VP4 können mitlesen)"
+        else:
+            gesichert = "🔓 unverschlüsselt"
         self.chat_titel.configure(text=f"{name}   ·   {fid}   ·   {gesichert}")
         self._chat_verlauf_zeichnen(fid)
 
@@ -1676,6 +1760,89 @@ class VP4App(ctk.CTk):
         if fid == self.aktiver_chat:
             self._chat_verlauf_zeichnen(fid)
 
+    # ------------------------------------------------------------- Gruppen
+
+    def _gruppe_erstellen(self):
+        name = self._text_abfragen("Gruppe erstellen",
+                                   "Wie soll die Gruppe heißen?")
+        if name is None:
+            return
+        gid = self.gruppen.erstellen(name)
+        self.status(f"Gruppe '{self.gruppen.get(gid)['name']}' erstellt.", "gut")
+        self._chat_oeffnen(gid)
+        self._gruppen_code_zeigen(gid)
+
+    def _gruppe_beitreten(self):
+        code = self._text_abfragen(
+            "Gruppe beitreten",
+            "Füg den Code ein, den du bekommen hast:")
+        if not code:
+            return
+        try:
+            gid = self.gruppen.beitreten(code)
+        except ValueError as e:
+            self.status(str(e).split("\n")[0], "fehler")
+            messagebox.showerror("Das hat nicht geklappt", str(e), parent=self)
+            return
+        name = self._text_abfragen("Name", "Wie soll die Gruppe bei dir heißen? "
+                                           "(kann leer bleiben)")
+        if name:
+            self.gruppen.beitreten(code, name)
+        self.status(f"Du bist in der Gruppe '{self.gruppen.get(gid)['name']}'.", "gut")
+        self._chat_oeffnen(gid)
+
+    def _gruppen_code_zeigen(self, gid=None):
+        """Zeigt den Einladungscode der gewählten Gruppe zum Weitergeben."""
+        gid = gid or self.aktiver_chat
+        if not gid or not speicher.ist_gruppen_id(gid) or gid not in self.gruppen:
+            self.status("Wähl zuerst links eine Gruppe aus.", "warn")
+            return
+        gruppe = self.gruppen.get(gid)
+        code = self.gruppen.code(gid)
+
+        fenster = ctk.CTkToplevel(self)
+        fenster.title("Einladungscode")
+        fenster.geometry("560x320")
+        fenster.configure(fg_color=FARBE["flaeche"])
+        fenster.transient(self)
+        fenster.grab_set()
+
+        ctk.CTkLabel(fenster, text=f"👥  {gruppe['name']}", font=schrift(17, True),
+                     text_color=FARBE["text"]).pack(pady=(22, 2))
+        ctk.CTkLabel(fenster, text=gid, font=schrift(11),
+                     text_color=FARBE["text_leise"]).pack()
+        ctk.CTkLabel(fenster,
+                     text="Schick diesen Code deinen Freunden. Wer ihn hat, ist dabei.",
+                     font=schrift(12), text_color=FARBE["text"]).pack(pady=(14, 6))
+
+        feld = ctk.CTkTextbox(fenster, height=70, corner_radius=RADIUS,
+                              font=schrift(11), border_width=1,
+                              border_color=FARBE["rand"],
+                              fg_color=FARBE["flaeche_tief"], wrap="char")
+        feld.pack(fill="x", padx=24)
+        feld.insert("1.0", code)
+        feld.configure(state="disabled")
+
+        def kopieren():
+            self.clipboard_clear()
+            self.clipboard_append(code)
+            self.status("Einladungscode kopiert.", "gut")
+
+        reihe = ctk.CTkFrame(fenster, fg_color="transparent")
+        reihe.pack(pady=12)
+        knopf(reihe, "Code kopieren", kopieren, art="primaer",
+              breite=170, hoehe=36).pack(side="left", padx=5)
+        knopf(reihe, "Schließen", fenster.destroy, art="leise",
+              breite=120, hoehe=36).pack(side="left", padx=5)
+
+        ctk.CTkLabel(fenster,
+                     text="⚠  Im Code steckt der Schlüssel der Gruppe. Wer ihn "
+                          "bekommt, kann alles mitlesen – auch Älteres, das noch "
+                          "im Kanal steht. Zurückholen lässt er sich nicht; wenn "
+                          "jemand raus soll, macht ihr eine neue Gruppe auf.",
+                     font=schrift(10), text_color=FARBE["warn"], justify="left",
+                     wraplength=500).pack(padx=24)
+
     def _freund_hinzufuegen(self):
         fid = self._text_abfragen("Freund hinzufügen",
                                   "ID deines Freundes (Form ABCD-1234):")
@@ -1690,21 +1857,45 @@ class VP4App(ctk.CTk):
             return
         self.status(f"'{fid}' zur Freundesliste hinzugefügt.", "gut")
 
-    def _freund_entfernen(self):
-        if not self.aktiver_chat:
-            self.status("Bitte zuerst einen Freund auswählen.", "warn")
+    def _eintrag_entfernen(self):
+        """Entfernt den gewählten Eintrag - einen Freund oder eine Gruppe."""
+        gewaehlt = self.aktiver_chat
+        if not gewaehlt:
+            self.status("Bitte zuerst jemanden auswählen.", "warn")
             return
-        if messagebox.askyesno("Entfernen?",
-                               f"'{self.aktiver_chat}' aus der Freundesliste entfernen?",
-                               parent=self):
-            self.friends.remove(self.aktiver_chat)
-            self.aktiver_chat = None
-            self.chat_titel.configure(text="Kein Freund ausgewählt")
-            self._chat_verlauf_zeichnen(None)
+
+        if speicher.ist_gruppen_id(gewaehlt):
+            gruppe = self.gruppen.get(gewaehlt) or {}
+            name = gruppe.get("name") or gewaehlt
+            if not messagebox.askyesno(
+                    "Gruppe verlassen?",
+                    f"'{name}' verlassen?\n\nDu bekommst dann nichts mehr aus "
+                    f"dieser Gruppe. Zurück kommst du nur über den Code – heb "
+                    f"ihn dir auf, wenn du dir nicht sicher bist.",
+                    parent=self):
+                return
+            self.gruppen.verlassen(gewaehlt)
+            self.status(f"Gruppe '{name}' verlassen.", "warn")
+        else:
+            if not messagebox.askyesno(
+                    "Entfernen?", f"'{gewaehlt}' aus der Freundesliste entfernen?",
+                    parent=self):
+                return
+            self.friends.remove(gewaehlt)
+
+        self.aktiver_chat = None
+        self.chat_titel.configure(text="Niemand ausgewählt")
+        self._chat_verlauf_zeichnen(None)
 
     def _gemeinsamen_schluessel_setzen(self):
         if not self.aktiver_chat:
             self.status("Bitte zuerst einen Freund auswählen.", "warn")
+            return
+        if speicher.ist_gruppen_id(self.aktiver_chat):
+            # Eine Gruppe hat ihren Schlüssel schon - er steckt im Code.
+            self.status("Eine Gruppe hat ihren eigenen Schlüssel - "
+                        "gib den Code weiter.", "warn")
+            self._gruppen_code_zeigen()
             return
         fenster = ctk.CTkToplevel(self)
         fenster.title("Gemeinsamer Schlüssel")
@@ -1755,25 +1946,32 @@ class VP4App(ctk.CTk):
 
     def _chat_senden(self):
         if not self.aktiver_chat:
-            self.status("Bitte zuerst einen Freund auswählen.", "warn")
+            self.status("Bitte zuerst links jemanden auswählen.", "warn")
             return
         text = self.chat_eingabe.get().strip()
         if not text:
             return
         try:
-            verschluesselt = self.network.send_text(self.aktiver_chat, text)
-        except (ConnectionError, OSError) as e:
-            self.status(str(e), "fehler")
+            # ValueError gehört mit dazu: über Discord wird nur Verschlüsseltes
+            # verschickt, und fehlt der gemeinsame Schlüssel, ist genau das der
+            # Fehler. Ohne ihn hier abzufangen, stirbt der Rückruf still - in
+            # einem Fenster ohne Konsole sieht das niemand.
+            verschluesselt, weg = self.network.send_text_mit_weg(
+                self.aktiver_chat, text)
+        except (ConnectionError, OSError, ValueError) as e:
+            self.status(str(e).split("\n")[0], "fehler")
             self._chat_zeile(self.aktiver_chat, f"   ✗ nicht zugestellt: {text}")
+            messagebox.showerror("Senden fehlgeschlagen", str(e), parent=self)
             return
         self.chat_eingabe.delete(0, "end")
         zeit = datetime.now().strftime("%H:%M")
         self._chat_zeile(self.aktiver_chat,
-                         f"[{zeit}] Du {'🔒' if verschluesselt else '🔓'}: {text}")
+                         f"[{zeit}] Du {'🔒' if verschluesselt else '🔓'}"
+                         f"{self._weg_zeichen(weg)}: {text}")
 
     def _datei_senden(self):
         if not self.aktiver_chat:
-            self.status("Bitte zuerst einen Freund auswählen.", "warn")
+            self.status("Bitte zuerst links jemanden auswählen.", "warn")
             return
         pfad = filedialog.askopenfilename(title="Datei senden")
         if not pfad:
@@ -1783,15 +1981,50 @@ class VP4App(ctk.CTk):
                else "video" if endung in (".mp4", ".mov", ".avi", ".mkv")
                else "datei")
         try:
-            verschluesselt = self.network.send_file(self.aktiver_chat, pfad, art)
+            verschluesselt, weg = self.network.send_file_mit_weg(
+                self.aktiver_chat, pfad, art)
         except (ConnectionError, OSError, ValueError) as e:
-            self.status(str(e), "fehler")
+            self.status(str(e).split("\n")[0], "fehler")
             messagebox.showerror("Senden fehlgeschlagen", str(e), parent=self)
             return
         zeit = datetime.now().strftime("%H:%M")
         self._chat_zeile(self.aktiver_chat,
-                         f"[{zeit}] Du {'🔒' if verschluesselt else '🔓'}: "
+                         f"[{zeit}] Du {'🔒' if verschluesselt else '🔓'}"
+                         f"{self._weg_zeichen(weg)}: "
                          f"📎 {Path(pfad).name} gesendet")
+
+    def _absendername(self, fid: str, selbstauskunft: str = None) -> str:
+        """Der Name für eine ID.
+
+        Reihenfolge: der Name, den man selbst vergeben hat, dann der Name,
+        den der Absender in der Gruppe angibt, sonst die ID.
+
+        Der eigene Name geht vor, weil der mitgeschickte nur eine Behauptung
+        ist - nachprüfen kann ihn niemand. Wer bei dir "Max" heißt, bleibt
+        "Max", auch wenn sich jemand anders so nennt.
+        """
+        eigener = (self.friends.get(fid) or {}).get("nickname")
+        if eigener:
+            return eigener
+        if selbstauskunft:
+            return f"{selbstauskunft} ({fid})"
+        return fid
+
+    def _benachrichtigung(self, name: str, gruppe) -> str:
+        if gruppe:
+            gruppen_name = (self.gruppen.get(gruppe) or {}).get("name") or gruppe
+            return f"Neue Nachricht von {name} in '{gruppen_name}'."
+        return f"Neue Nachricht von {name}."
+
+    @staticmethod
+    def _weg_zeichen(weg) -> str:
+        """🌐 markiert eine Zeile, die über Discord gegangen ist.
+
+        Im WLAN steht nichts dahinter - das ist der Normalfall und soll die
+        Zeile nicht vollstellen. Sichtbar wird nur der Umweg übers Internet,
+        denn dort landet die Nachricht auf einem fremden Server.
+        """
+        return "🌐" if weg == "discord" else ""
 
     # =================================================== Seite: Einstellungen
 
@@ -1862,8 +2095,94 @@ class VP4App(ctk.CTk):
                      font=schrift(10), text_color=FARBE["text_leise"],
                      justify="left", wraplength=660).pack(anchor="w", padx=18, pady=(0, 14))
 
+        # --- Dein Name ------------------------------------------------------
+        reihe = ctk.CTkFrame(block, fg_color="transparent")
+        reihe.pack(fill="x", padx=18, pady=(0, 14))
+        ctk.CTkLabel(reihe, text="Dein Name", font=schrift(12), width=170,
+                     anchor="w", text_color=FARBE["text"]).pack(side="left")
+        self.name_feld = ctk.CTkEntry(
+            reihe, height=32, corner_radius=RADIUS, font=schrift(11),
+            placeholder_text=f"leer = deine ID ({self.my_id})")
+        self.name_feld.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        if self.config_data.get("anzeigename"):
+            self.name_feld.insert(0, self.config_data["anzeigename"])
+        knopf(reihe, "Merken", self._anzeigename_speichern, art="leise",
+              breite=90, hoehe=32).pack(side="left")
+        ctk.CTkLabel(block,
+                     text="So tauchst du in Gruppen auf. In Einzelchats zählt "
+                          "weiter der Name, den dein Freund dir gegeben hat.",
+                     font=schrift(10), text_color=FARBE["text_leise"],
+                     justify="left", wraplength=660).pack(anchor="w", padx=18,
+                                                          pady=(0, 14))
+
+        # --- Discord --------------------------------------------------------
+        block = self._einstellungsblock(seite, 4, "Discord (Chat über das Internet)")
+
+        reihe = ctk.CTkFrame(block, fg_color="transparent")
+        reihe.pack(fill="x", padx=18, pady=(0, 10))
+        ctk.CTkLabel(reihe, text="Transportweg", font=schrift(12),
+                     text_color=FARBE["text"]).pack(side="left")
+        self.transport_wahl = ctk.CTkOptionMenu(
+            reihe, values=[transport.MODUS_NAMEN[m] for m in transport.MODI],
+            width=210, height=32, corner_radius=RADIUS, font=schrift(12),
+            fg_color=FARBE["akzent"], text_color="#ffffff",
+            button_color=FARBE["akzent"], button_hover_color=FARBE["akzent_hover"],
+            command=self._transport_gewaehlt)
+        self.transport_wahl.pack(side="right")
+        self.transport_wahl.set(transport.MODUS_NAMEN.get(
+            self.config_data.get("transport_modus", "lan"),
+            transport.MODUS_NAMEN["lan"]))
+
+        d_cfg = discord_transport.discord_config_laden()
+
+        reihe = ctk.CTkFrame(block, fg_color="transparent")
+        reihe.pack(fill="x", padx=18, pady=(0, 6))
+        ctk.CTkLabel(reihe, text="Bot-Token", font=schrift(12), width=90,
+                     anchor="w", text_color=FARBE["text"]).pack(side="left")
+        self.discord_token_feld = ctk.CTkEntry(
+            reihe, height=32, corner_radius=RADIUS, font=schrift(11), show="•",
+            placeholder_text="aus dem Discord Developer-Portal")
+        self.discord_token_feld.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        if d_cfg.get("bot_token"):
+            self.discord_token_feld.insert(0, d_cfg["bot_token"])
+
+        reihe = ctk.CTkFrame(block, fg_color="transparent")
+        reihe.pack(fill="x", padx=18, pady=(0, 8))
+        ctk.CTkLabel(reihe, text="Kanal-ID", font=schrift(12), width=90,
+                     anchor="w", text_color=FARBE["text"]).pack(side="left")
+        self.discord_kanal_feld = ctk.CTkEntry(
+            reihe, height=32, corner_radius=RADIUS, font=schrift(11),
+            placeholder_text="Rechtsklick auf den Kanal → Kanal-ID kopieren")
+        self.discord_kanal_feld.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        if d_cfg.get("kanal_id"):
+            self.discord_kanal_feld.insert(0, str(d_cfg["kanal_id"]))
+
+        reihe = ctk.CTkFrame(block, fg_color="transparent")
+        reihe.pack(fill="x", padx=18, pady=(0, 8))
+        knopf(reihe, "Speichern und verbinden", self._discord_speichern,
+              art="primaer", breite=210, hoehe=34).pack(side="left")
+        self.discord_status = ctk.CTkLabel(
+            reihe, text=self._discord_statustext(), font=schrift(11),
+            text_color=FARBE["text_leise"])
+        self.discord_status.pack(side="left", padx=12)
+
+        ctk.CTkLabel(block,
+                     text="Alle Freunde brauchen denselben Bot-Token und dieselbe "
+                          "Kanal-ID. Im Developer-Portal muss beim Bot zusätzlich "
+                          "'MESSAGE CONTENT INTENT' eingeschaltet sein – sonst "
+                          "kommen alle Nachrichten leer an.",
+                     font=schrift(10), text_color=FARBE["text_leise"],
+                     justify="left", wraplength=660).pack(anchor="w", padx=18, pady=(0, 6))
+        ctk.CTkLabel(block,
+                     text="⚠  Über Discord wird nur verschlüsselt gesendet – der "
+                          "Kanal ist für alle im Server lesbar und Discord speichert "
+                          "alles dauerhaft. Wer wann wem schreibt, sieht Discord "
+                          "trotzdem mit. Im WLAN bleibt alles im Haus.",
+                     font=schrift(10), text_color=FARBE["warn"],
+                     justify="left", wraplength=660).pack(anchor="w", padx=18, pady=(0, 14))
+
         # --- Daten ----------------------------------------------------------
-        block = self._einstellungsblock(seite, 4, "Daten")
+        block = self._einstellungsblock(seite, 5, "Daten")
         ctk.CTkLabel(block, text=f"Deine Dateien liegen in:\n{speicher.DATA_DIR}",
                      font=schrift(11), text_color=FARBE["text_leise"],
                      justify="left").pack(anchor="w", padx=18, pady=(0, 8))
@@ -1873,6 +2192,80 @@ class VP4App(ctk.CTk):
                       text_color=FARBE["text"], hover_color=FARBE["flaeche_tief"],
                       command=self._datenordner_oeffnen).pack(anchor="w", padx=18,
                                                               pady=(0, 16))
+
+    def _anzeigename_speichern(self):
+        name = self.name_feld.get().strip()[:40]
+        self.config_data["anzeigename"] = name
+        speicher.save_config(self.config_data)
+        # Der laufende Discord-Transport hält den Namen selbst - ohne das
+        # hier stünde in Gruppen bis zum Neustart weiter der alte.
+        self.network.anzeigename = name
+        if self.network.discord is not None:
+            self.network.discord.anzeigename = name
+        self.status(f"In Gruppen heißt du jetzt "
+                    f"'{name or self.my_id}'.", "gut")
+
+    def _chat_ueberschrift_text(self) -> str:
+        return {
+            # Bei "beide" sucht sich VP4 den Weg selbst - das ist der
+            # Normalfall und muss niemanden beschäftigen. Nur wer den Weg
+            # ausdrücklich festgelegt hat, soll ihn auch oben lesen.
+            "lan": "Chat im WLAN",
+            "discord": "Chat über Discord",
+            "beide": "Chat",
+        }.get(self.config_data.get("transport_modus", "lan"), "Chat")
+
+    def _discord_statustext(self) -> str:
+        if self.config_data.get("transport_modus", "lan") == "lan":
+            return "aus"
+        if self.network.discord_verbunden:
+            return "verbunden"
+        if not discord_transport.ist_eingerichtet():
+            return "noch nicht eingerichtet"
+        return "verbindet …"
+
+    def _transport_gewaehlt(self, wahl):
+        modus = {v: k for k, v in transport.MODUS_NAMEN.items()}[wahl]
+        self.config_data["transport_modus"] = modus
+        speicher.save_config(self.config_data)
+        self.network.modus_setzen(modus, discord_transport.discord_config_laden())
+        self.discord_status.configure(text=self._discord_statustext())
+        # Die Chatseite ist eventuell längst gebaut - ihre Überschrift muss
+        # mitwandern, sonst steht dort weiter der alte Weg.
+        if getattr(self, "chat_ueberschrift", None) is not None:
+            try:
+                self.chat_ueberschrift.configure(text=self._chat_ueberschrift_text())
+            except Exception:
+                pass
+        self.status(f"Transportweg: {wahl}.", "gut")
+
+    def _discord_speichern(self):
+        """Nimmt Token und Kanal-ID entgegen und baut die Verbindung neu auf."""
+        token = self.discord_token_feld.get().strip()
+        kanal = self.discord_kanal_feld.get().strip()
+
+        if kanal and not kanal.isdigit():
+            self.status("Die Kanal-ID muss eine reine Zahl sein.", "fehler")
+            messagebox.showerror(
+                "Kanal-ID stimmt nicht",
+                "Eine Discord-Kanal-ID besteht nur aus Ziffern.\n\n"
+                "So findest du sie:\n"
+                "1. Discord → Einstellungen → Erweitert → Entwicklermodus an\n"
+                "2. Rechtsklick auf den Textkanal → 'Kanal-ID kopieren'",
+                parent=self)
+            return
+
+        discord_transport.discord_config_speichern(
+            {"bot_token": token, "kanal_id": kanal})
+
+        if self.config_data.get("transport_modus", "lan") == "lan":
+            self.status("Gespeichert. Stell den Transportweg um, damit es "
+                        "benutzt wird.", "warn")
+        else:
+            self.network.modus_setzen(self.config_data["transport_modus"],
+                                      {"bot_token": token, "kanal_id": kanal})
+            self.status("Gespeichert – verbinde mit Discord …", "gut")
+        self.discord_status.configure(text=self._discord_statustext())
 
     def _einstellungsblock(self, eltern, zeile, titel):
         block = ctk.CTkFrame(eltern, fg_color=FARBE["flaeche_tief"], corner_radius=RADIUS)
@@ -1987,9 +2380,10 @@ class VP4App(ctk.CTk):
         return f"""VERSCHLÜSSELUNGS PROGRAMM 4.0
 
 Ein Programm zum Ver- und Entschlüsseln, zum Verwalten von Schlüsseln
-und zum Chatten im eigenen WLAN. Alles läuft auf deinem Rechner – es
-werden keine Daten ins Internet geschickt, und es wird keine KI dafür
-gebraucht.
+und zum Chatten mit Freunden. Verschlüsselt und entschlüsselt wird
+alles auf deinem Rechner, und es wird keine KI dafür gebraucht. Ins
+Internet geht nur, was du selbst über den Chat verschickst – und auch
+das nur verschlüsselt.
 
 
 WAS IST WIRKLICH SICHER?
@@ -2042,29 +2436,79 @@ taugt: Jeder Weg zurück wäre auch ein Weg für jemand anderen.
 DER CHAT
 
 Beim ersten Start bekommt jede Installation eine eigene ID. Tausche
-sie mit Freunden im selben WLAN, dann könnt ihr chatten und Bilder
-oder Videos schicken. Es läuft direkt zwischen euren Rechnern – ohne
-Server, ohne Internet.
+sie mit Freunden, dann könnt ihr chatten und Bilder oder Videos
+schicken. Sitzt ihr im selben WLAN, läuft es direkt zwischen euren
+Rechnern – ohne Server, ohne Internet. Sonst nimmt VP4 den Umweg über
+einen Discord-Kanal; verschlüsselt wird dabei genauso, Discord
+bekommt nur den Geheimtext zu sehen.
 
-Damit die Nachrichten verschlüsselt sind, müsst ihr beide denselben
-gemeinsamen Schlüssel eintragen (🔑-Knopf in der Freundesliste). Ohne
-das gehen sie unverschlüsselt durchs WLAN.
+Eine Zeile im Chat zeigt mit 🌐, wenn sie diesen Umweg genommen hat.
 
-Ehrlich gesagt: Die IDs werden offen im Netz bekannt gegeben, und beim
-Verbinden wird nur behauptet, wer man ist – nachgeprüft wird es nicht.
-Wer im selben WLAN sitzt, könnte sich also als ein Freund von dir
-ausgeben. Für ein Programm unter Freunden ist das in Ordnung, für
-Vertrauliches nicht.
+
+GRUPPEN
+
+Neben einzelnen Freunden gibt es Gruppen. "＋ Gruppe" macht eine neue
+auf, "Beitreten" bringt dich in eine fremde, und "Code" zeigt den
+Einladungscode der gewählten Gruppe.
+
+Der Code ist die ganze Mitgliedschaft: Wer ihn hat, ist dabei – eine
+Liste, wer dazugehört, gibt es nicht. Das macht das Beitreten einfach
+und hat einen Preis: Zurückholen lässt sich ein Code nicht. Soll
+jemand nicht mehr mitlesen, macht ihr eine neue Gruppe auf.
+
+In einer Gruppe kennt ihr euch nicht gegenseitig als Freunde. Deshalb
+schickt jeder seinen Namen mit – den, der unter Einstellungen bei
+"Dein Name" steht. Nachprüfen kann den niemand, also steht die ID in
+Klammern dahinter. Wen du selbst in deiner Freundesliste hast, siehst
+du immer unter dem Namen, den du ihm gegeben hast.
+
+Gruppen laufen immer über Discord, auch wenn ihr im selben WLAN sitzt:
+Im WLAN müsste VP4 wissen, an wen es die Nachricht schicken soll – und
+genau das weiß bei einer Gruppe niemand.
+
+
+WIE GUT SIND DIE NACHRICHTEN GESCHÜTZT?
+
+Das hängt davon ab, welcher Schlüssel benutzt wird – und das steht
+oben im Chat und neben jedem Freund:
+
+  🔒  Ein eigener Schlüssel, den nur ihr zwei habt (🔑-Knopf in der
+      Freundesliste). Niemand sonst kann mitlesen, auch kein anderer
+      VP4-Benutzer.
+
+  👥  Der eingebaute Gruppenschlüssel. Er steckt in dieser Programm-
+      datei, damit ihr sofort loslegen könnt, ohne etwas auszutauschen.
+      Gegen Discord und gegen Fremde schützt er vollständig – aber
+      jeder, der dasselbe VP4 hat, kann alles im Kanal mitlesen, auch
+      Nachrichten zwischen zwei anderen. Es ist also eher ein
+      Gruppenchat als ein privates Gespräch.
+
+  🔓  Gar kein Schlüssel. Das geht nur im WLAN; über Discord wird
+      unverschlüsselt grundsätzlich nichts verschickt.
+
+Willst du mit einem bestimmten Freund wirklich unter vier Augen
+schreiben, trag für ihn einen eigenen Schlüssel ein. Der geht dem
+Gruppenschlüssel immer vor.
+
+Ehrlich gesagt: Beim Verbinden wird nur behauptet, wer man ist –
+nachgeprüft wird es nicht. Wer im selben WLAN sitzt oder im selben
+Discord-Kanal ist, könnte sich als ein Freund von dir ausgeben. Für
+ein Programm unter Freunden ist das in Ordnung, für Vertrauliches
+nicht.
 
 
 WENN DER CHAT NICHT GEHT
 
-- Sind beide im selben WLAN? Ein Gäste-WLAN trennt die Geräte oft
-  voneinander ab, dann findet ihr euch nicht.
-- Hat die Windows-Firewall beim ersten Start gefragt? Dann muss VP4
-  erlaubt sein – sonst kommen keine Verbindungen an.
-- Steht unten rechts "Chat: bereit"? Wenn dort ein Fehler steht,
-  konnte der Chat-Server nicht starten.
+- Steht unten rechts, dass der Chat läuft? Dort steht auch, welcher
+  Weg gerade offen ist. Ein Fehler an dieser Stelle erklärt meistens
+  schon alles.
+- Habt ihr beide dieselbe Programmversion? Der Zugang zu Discord
+  steckt in der Programmdatei – eine alte .exe kennt ihn noch nicht.
+- Soll es direkt übers WLAN gehen: Seid ihr wirklich im selben Netz?
+  Ein Gäste-WLAN trennt die Geräte oft voneinander ab. Und die
+  Windows-Firewall muss VP4 erlauben, sonst kommt nichts an.
+- Über Discord braucht nur einer von euch beiden online zu sein, um
+  zu schreiben – die Nachricht wartet dann im Kanal.
 
 
 EHRLICHER HINWEIS
@@ -2165,19 +2609,28 @@ es nicht die einzige Absicherung sein.
 
                 if art == "message":
                     fid = daten["from"]
-                    name = (self.friends.get(fid) or {}).get("nickname") or fid
+                    name = self._absendername(fid, daten.get("name"))
+                    # In einer Gruppe gehört die Zeile in den Verlauf der
+                    # Gruppe, nicht in den des Absenders - sonst tauchte eine
+                    # Gruppennachricht in einem Einzelchat auf.
+                    wohin = daten.get("gruppe") or fid
                     schloss = "🔒" if daten["encrypted"] else "🔓"
+                    weg = self._weg_zeichen(daten.get("weg"))
                     zeit = datetime.now().strftime("%H:%M")
-                    self._chat_zeile(fid, f"[{zeit}] {name} {schloss}: {daten['text']}")
-                    if fid != self.aktiver_chat:
-                        self.status(f"Neue Nachricht von {name}.", "gut")
+                    self._chat_zeile(wohin,
+                                     f"[{zeit}] {name} {schloss}{weg}: {daten['text']}")
+                    if wohin != self.aktiver_chat:
+                        self.status(self._benachrichtigung(name, daten.get("gruppe")),
+                                    "gut")
 
                 elif art == "file":
                     fid = daten["from"]
-                    name = (self.friends.get(fid) or {}).get("nickname") or fid
+                    name = self._absendername(fid)
+                    wohin = daten.get("gruppe") or fid
+                    weg = self._weg_zeichen(daten.get("weg"))
                     zeit = datetime.now().strftime("%H:%M")
-                    self._chat_zeile(fid, f"[{zeit}] {name}: 📎 {daten['name']}")
-                    self._chat_zeile(fid, f"          gespeichert unter {daten['path']}")
+                    self._chat_zeile(wohin, f"[{zeit}] {name}{weg}: 📎 {daten['name']}")
+                    self._chat_zeile(wohin, f"          gespeichert unter {daten['path']}")
                     self.status(f"Datei von {name} empfangen.", "gut")
 
                 elif art == "peer_update":
@@ -2217,6 +2670,25 @@ es nicht die einzige Absicherung sein.
                 elif art == "server_bereit":
                     self.chat_status.configure(text=f"Chat: bereit (Port {daten})",
                                                text_color=FARBE["gut"])
+
+                elif art == "discord_bereit":
+                    # Ohne diese Rückmeldung stünde in den Einstellungen für
+                    # immer "verbindet …", auch wenn der Bot längst drin ist.
+                    wo = ("WLAN + Discord"
+                          if self.config_data.get("transport_modus") == "beide"
+                          else "Discord")
+                    self.chat_status.configure(text=f"Chat: {wo} ({daten})",
+                                               text_color=FARBE["gut"])
+                    self.status(f"Mit Discord verbunden als {daten}.", "gut")
+                    if getattr(self, "discord_status", None) is not None:
+                        try:
+                            self.discord_status.configure(
+                                text=self._discord_statustext())
+                        except Exception:
+                            # Die Einstellungsseite kann seit dem Verbinden neu
+                            # gebaut worden sein - dann ist das Feld weg, und
+                            # das ist kein Grund, den Chat anzuhalten.
+                            pass
 
                 elif art == "error":
                     # Früher ging das über print() ins Leere - in einem Fenster

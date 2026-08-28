@@ -107,6 +107,16 @@ STANDARD_EINSTELLUNGEN = {
     "farbe": "blau",               # Akzentfarbe der Oberfläche
     "master_passwort_gesetzt": False,
     "chat_aktiv": True,
+    # Welcher Weg für den Chat: "lan", "discord" oder "beide".
+    # "beide" ist die Voreinstellung, damit der Chat einfach funktioniert,
+    # sobald jemand das Programm offen hat - im selben WLAN direkt, sonst über
+    # Discord. Ohne eingebauten oder eingetragenen Discord-Zugang bleibt es
+    # still beim WLAN, es wird also nichts ungefragt ins Internet geschickt.
+    "transport_modus": "beide",
+    # Der Name, unter dem man in Gruppen auftaucht. Leer heißt: die eigene
+    # ID. In einer Gruppe kennt man sich nicht gegenseitig als Freunde, es
+    # gäbe also sonst nichts als "MAXX-0002" zu lesen.
+    "anzeigename": "",
 }
 
 
@@ -431,6 +441,138 @@ class FriendsStore:
 
     def get(self, friend_id: str):
         return self.data.get(friend_id)
+
+    def all(self):
+        return dict(self.data)
+
+
+# =============================================================================
+#  Gruppen
+# =============================================================================
+# Eine Gruppe ist eine Kennung plus ein Schlüssel, den alle Mitglieder haben.
+# Wer den Einladungscode bekommt, ist dabei - eine Mitgliederliste gibt es
+# bewusst nicht. Das ist der ganze Trick: Niemand muss verwalten, wer dazu
+# gehört, und trotzdem kann nur mitlesen, wer den Code hat.
+#
+# Deshalb gilt aber auch: Ein Code, der einmal weitergegeben wurde, lässt
+# sich nicht zurückholen. Wer jemanden loswerden will, macht eine neue
+# Gruppe auf. Genau so steht es auch im Programm.
+
+GROUPS_FILE = DATA_DIR / "gruppen.json"
+
+GRUPPEN_PRAEFIX = "G-"
+GRUPPEN_CODE_MARKE = "VP4G1-"
+
+
+def ist_gruppen_id(kennung: str) -> bool:
+    """Gruppen-IDs fangen mit "G-" an, Freundes-IDs nie.
+
+    Im Kanal steht in jeder Zeile, für wen sie ist - mal ein Freund, mal eine
+    Gruppe. Ohne einen Unterschied, den man ansieht, müsste der Empfänger
+    raten, mit welchem Schlüssel er es versuchen soll.
+    """
+    return (kennung or "").upper().startswith(GRUPPEN_PRAEFIX)
+
+
+def gruppen_id_erzeugen() -> str:
+    """Eine neue Gruppenkennung der Form G-XXXXXXXX."""
+    roh = base64.b32encode(os.urandom(5)).decode("ascii").rstrip("=")
+    return GRUPPEN_PRAEFIX + roh[:8]
+
+
+def gruppen_code_bauen(gruppen_id: str, key_b64: str) -> str:
+    """Packt Kennung und Schlüssel in einen einzigen Text zum Weitergeben.
+
+    Beides wandert als rohe Bytes hinein - 5 für die Kennung, 32 für den
+    Schlüssel -, nicht als lesbarer Text. Der Code wird dadurch nur halb so
+    lang und passt in eine Zeile einer Nachricht; das ist der Unterschied
+    zwischen "kurz rüberschicken" und "der zerreißt beim Kopieren".
+    """
+    teil = gruppen_id[len(GRUPPEN_PRAEFIX):]
+    kennung = base64.b32decode(teil + "=" * (-len(teil) % 8))[:5]
+    roh = kennung + base64.b64decode(key_b64)
+    return GRUPPEN_CODE_MARKE + base64.urlsafe_b64encode(roh).decode("ascii").rstrip("=")
+
+
+def gruppen_code_lesen(code: str):
+    """Gegenstück zu gruppen_code_bauen(). Rückgabe: (gruppen_id, key_b64).
+
+    Löst ValueError aus, wenn der Code nicht stimmt - jemand hat ihn beim
+    Kopieren abgeschnitten, oder es war gar keiner.
+    """
+    code = (code or "").strip()
+    if not code.startswith(GRUPPEN_CODE_MARKE):
+        raise ValueError(
+            "Das sieht nicht nach einem Gruppen-Code aus.\n\n"
+            "Ein Code fängt mit 'VP4G1-' an. Lass ihn dir noch einmal "
+            "schicken und kopier ihn ganz.")
+    roh_text = code[len(GRUPPEN_CODE_MARKE):]
+    try:
+        roh = base64.urlsafe_b64decode(roh_text + "=" * (-len(roh_text) % 4))
+        if len(roh) != 37:
+            raise ValueError
+        gruppen_id = GRUPPEN_PRAEFIX + base64.b32encode(roh[:5]).decode("ascii")
+        key_b64 = base64.b64encode(roh[5:]).decode("ascii")
+    except Exception:
+        raise ValueError(
+            "Der Gruppen-Code ist unvollständig oder beschädigt.\n\n"
+            "Meistens fehlt beim Kopieren das Ende. Lass ihn dir noch "
+            "einmal schicken.")
+    return gruppen_id, key_b64
+
+
+class GruppenStore:
+    """Die Gruppen, in denen man ist - Kennung, Name und Schlüssel."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.data = load_json(self.path, {})
+        self._lock = threading.Lock()
+
+    def save(self):
+        save_json(self.path, self.data)
+
+    def erstellen(self, name: str) -> str:
+        """Legt eine neue Gruppe an und gibt ihre Kennung zurück."""
+        from krypto import ModernCrypto
+
+        gruppen_id = gruppen_id_erzeugen()
+        with self._lock:
+            self.data[gruppen_id] = {
+                "name": (name or "").strip() or "Gruppe",
+                "key_b64": ModernCrypto.generate_aes_key(),
+            }
+        self.save()
+        return gruppen_id
+
+    def beitreten(self, code: str, name: str = "") -> str:
+        """Tritt über einen Einladungscode bei. Rückgabe: die Kennung."""
+        gruppen_id, key_b64 = gruppen_code_lesen(code)
+        with self._lock:
+            vorher = self.data.get(gruppen_id, {})
+            self.data[gruppen_id] = {
+                "name": (name or "").strip() or vorher.get("name") or "Gruppe",
+                "key_b64": key_b64,
+            }
+        self.save()
+        return gruppen_id
+
+    def verlassen(self, gruppen_id: str):
+        with self._lock:
+            self.data.pop(gruppen_id, None)
+        self.save()
+
+    def code(self, gruppen_id: str) -> str:
+        gruppe = self.data.get(gruppen_id)
+        if not gruppe:
+            raise ValueError("Diese Gruppe gibt es nicht (mehr).")
+        return gruppen_code_bauen(gruppen_id, gruppe["key_b64"])
+
+    def __contains__(self, gruppen_id: str):
+        return gruppen_id in self.data
+
+    def get(self, gruppen_id: str):
+        return self.data.get(gruppen_id)
 
     def all(self):
         return dict(self.data)

@@ -17,3 +17,8 @@ __pycache__/
 # doch einmal eine im Projektordner auftaucht, darf sie nie ins Repo.
 VP4 Schluessel.md
 *Schluessel*.md
+
+# Alte Vorgaengerfassungen, die noch herumliegen (discord_relay.py und die
+# erste discord_konfig.py). Sie sind durch transport.py und
+# discord_transport.py ersetzt und sollen nicht mit ins Repo.
+_to_delete/

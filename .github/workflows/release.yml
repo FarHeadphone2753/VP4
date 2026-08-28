@@ -42,20 +42,56 @@ jobs:
       - name: Pakete installieren
         run: |
           python -m pip install --upgrade pip
-          pip install cryptography customtkinter pillow pyinstaller
+          pip install cryptography argon2-cffi customtkinter pillow pyinstaller discord.py
 
       - name: Selbsttest
         env:
           VP4_TEST_OHNE_GUI: "1"     # auf GitHubs Rechnern gibt es keinen Bildschirm
         run: python test_vp4.py
 
+      # Erst NACH dem Selbsttest, damit der Token nirgends in einer
+      # Testausgabe auftauchen kann. Fehlen die Secrets, bleibt die Datei
+      # leer - dann baut alles genauso, nur ohne eingebauten Discord-Zugang,
+      # und der Chat über Discord lässt sich weiterhin von Hand einrichten.
+      - name: Discord-Zugang einsetzen
+        env:
+          BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          KANAL_ID: ${{ secrets.DISCORD_KANAL_ID }}
+          GRUPPEN_SCHLUESSEL: ${{ secrets.VP4_GRUPPEN_SCHLUESSEL }}
+        run: |
+          if ($env:BOT_TOKEN -and $env:KANAL_ID) {
+            $datei = "discord_konfig.py"
+            $inhalt = Get-Content $datei -Raw -Encoding UTF8
+            $inhalt = $inhalt -replace 'BOT_TOKEN = ""', "BOT_TOKEN = `"$env:BOT_TOKEN`""
+            $inhalt = $inhalt -replace 'KANAL_ID = ""', "KANAL_ID = `"$env:KANAL_ID`""
+            if ($env:GRUPPEN_SCHLUESSEL) {
+              $inhalt = $inhalt -replace 'GRUPPEN_SCHLUESSEL = ""', "GRUPPEN_SCHLUESSEL = `"$env:GRUPPEN_SCHLUESSEL`""
+              Write-Output "Gruppenschlüssel eingesetzt."
+            } else {
+              Write-Output "WARNUNG: Kein VP4_GRUPPEN_SCHLUESSEL hinterlegt - Freunde"
+              Write-Output "muessen ihre Schluessel dann wieder von Hand austauschen."
+            }
+            Set-Content $datei $inhalt -Encoding UTF8 -NoNewline
+            Write-Output "Discord-Zugang eingesetzt (Kanal $env:KANAL_ID)."
+          } else {
+            Write-Output "Keine Discord-Secrets hinterlegt - die .exe wird ohne"
+            Write-Output "eingebauten Zugang gebaut. Zum Nachholen im Repo unter"
+            Write-Output "Settings > Secrets and variables > Actions anlegen:"
+            Write-Output "  DISCORD_BOT_TOKEN, DISCORD_KANAL_ID, VP4_GRUPPEN_SCHLUESSEL"
+          }
+
       - name: Icon erzeugen
         run: python icon_erzeugen.py
 
+      # discord.py wird erst zur Laufzeit importiert, wenn jemand den Weg über
+      # Discord einschaltet. PyInstaller sieht diesen Import nicht von selbst -
+      # ohne --collect-all fehlt das Paket in der .exe und der Chat über
+      # Discord meldet dort "Paket fehlt", obwohl alles eingerichtet ist.
       - name: VP4.exe bauen
         run: >
           pyinstaller --onefile --noconsole --name VP4
-          --icon vp4.ico --collect-all customtkinter --noconfirm VP4.py
+          --icon vp4.ico --collect-all customtkinter --collect-all discord
+          --noconfirm VP4.py
 
       - name: Nachsehen, ob die .exe entstanden ist
         run: |
