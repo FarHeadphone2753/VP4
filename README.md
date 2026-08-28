@@ -4,9 +4,11 @@
 
 # Verschlüsselungs Programm 4.0
 
-**Texte verschlüsseln, Schlüssel verwalten und im WLAN chatten – alles auf deinem eigenen Rechner.**
+**Texte, Dateien und Ordner verschlüsseln, Schlüssel verwalten und mit Freunden chatten.**
 
-Kein Konto, kein Server, keine Internetverbindung nötig. Nichts wird irgendwohin geschickt.
+Kein Konto, keine Anmeldung, kein eigener Server. Sitzt ihr im selben WLAN, läuft
+der Chat direkt zwischen euren Rechnern. Wenn nicht, nimmt er den Umweg über einen
+Discord-Kanal – verschlüsselt, Discord bekommt nur Geheimtext zu sehen.
 
 </div>
 
@@ -95,22 +97,58 @@ wieder einlesen. Praktisch, wenn du deine Notizen ohnehin dort hast.
 ⚠️ In der Notiz stehen die Schlüssel **im Klartext**. Wird dein Vault über
 Obsidian Sync, iCloud oder Dropbox synchronisiert, wandern sie mit.
 
-### Chat im WLAN
+### Chat – im WLAN und von überall
 
 Jede Installation bekommt beim ersten Start eine eigene ID wie `7AC5-EHTN`.
-Tauscht die IDs, und ihr könnt chatten und Bilder oder Videos schicken – direkt
-zwischen euren Rechnern, ohne Server und ohne Internet.
+Tauscht die IDs, und ihr könnt chatten und Bilder oder Videos schicken.
 
-Für verschlüsselte Nachrichten tragt ihr **beide denselben gemeinsamen
-Schlüssel** ein (🔑 in der Freundesliste). Ohne das gehen die Nachrichten
-unverschlüsselt durchs WLAN.
+VP4 sucht sich den Weg selbst:
+
+| Weg | Wann | Was passiert |
+|---|---|---|
+| **Direkt im WLAN** | Ihr seid im selben Netz | Die Nachricht geht unmittelbar von Rechner zu Rechner. Nichts verlässt die Wohnung. |
+| **Über Discord** 🌐 | Ihr seid es nicht | Die fertig verschlüsselte Nachricht nimmt den Umweg über einen Discord-Kanal. |
+
+Das WLAN hat dabei immer Vorrang – dort bleibt alles im Haus. Eine Chatzeile
+zeigt mit 🌐, wenn sie den Umweg genommen hat. Umstellen kannst du das unter
+**Einstellungen → Chat-Weg**.
+
+### Gruppen
+
+Neben einzelnen Freunden gibt es Gruppen. **＋ Gruppe** macht eine neue auf,
+**Beitreten** bringt dich in eine fremde, **Code** zeigt den Einladungscode.
+
+Der Code ist die ganze Mitgliedschaft: Wer ihn hat, ist dabei – eine Liste, wer
+dazugehört, gibt es nicht. Das macht das Beitreten einfach und hat einen Preis:
+Zurückholen lässt sich ein Code nicht, und wer beitritt, kann auch Älteres
+lesen, das noch im Kanal steht. Soll jemand nicht mehr mitlesen, macht ihr eine
+neue Gruppe auf.
+
+Gruppen laufen immer über Discord – auch wenn ihr im selben WLAN sitzt. Im WLAN
+müsste VP4 wissen, an wen es die Nachricht schicken soll, und das weiß bei einer
+Gruppe niemand.
+
+### Wie gut sind die Nachrichten geschützt?
+
+Das steht im Programm über jedem Chat und neben jedem Freund:
+
+- **🔒 Ein eigener Schlüssel**, den nur ihr zwei habt (🔑 in der Freundesliste).
+  Niemand sonst kann mitlesen, auch kein anderer VP4-Benutzer.
+- **👥 Der eingebaute Gruppenschlüssel.** Er steckt in der Programmdatei, damit
+  ihr sofort loslegen könnt, ohne vorher etwas auszutauschen. Gegen Discord und
+  gegen Fremde schützt er vollständig – aber **jeder, der dasselbe VP4 hat, kann
+  alles im Kanal mitlesen**, auch Nachrichten zwischen zwei anderen. Das ist eher
+  ein Gruppenchat als ein privates Gespräch.
+- **🔓 Gar kein Schlüssel.** Geht nur im WLAN. Über Discord verschickt VP4
+  grundsätzlich nichts Unverschlüsseltes – dort liest sonst jedes Server-Mitglied
+  mit, und Discord speichert alles dauerhaft.
+
+Willst du mit einem bestimmten Freund wirklich unter vier Augen schreiben, trag
+für ihn einen eigenen Schlüssel ein. Der geht dem Gruppenschlüssel immer vor.
 
 Über den Chat gehen zurzeit höchstens 50 MB verschlüsselt. Ist eine Datei
 grösser, **schickt VP4 sie nicht heimlich im Klartext**, sondern sagt es dir:
 verschlüssele sie dann auf der Seite *Dateien* und schicke die `.vp4`.
-
-**Der Chat funktioniert nur im selben WLAN.** Über das Internet geht es nicht –
-dafür bräuchte es einen Server, den es (noch) nicht gibt.
 
 ---
 
@@ -141,7 +179,8 @@ Wiederherstellungsmöglichkeit wäre auch ein Weg für jemand anderen.
 
 | Problem | Was hilft |
 |---|---|
-| Freund taucht nicht auf | Seid ihr im **selben** WLAN? Ein Gäste-WLAN trennt Geräte voneinander ab. |
+| Freund taucht nicht auf | Im selben WLAN: Ein Gäste-WLAN trennt Geräte voneinander ab. Sonst muss unter **Einstellungen → Chat-Weg** „WLAN und Discord" oder „nur Discord" stehen. |
+| Nichts geht über Discord | Ist ein Discord-Zugang hinterlegt? In der fertigen `VP4.exe` steckt er drin; startest du aus dem Quelltext, trägst du ihn unter **Einstellungen → Discord** selbst ein. |
 | Unten steht „Chat: Fehler" | Der Port war belegt. VP4 einmal beenden und neu starten. |
 | Niemand erreicht dich | Hat die Windows-Firewall beim ersten Start gefragt? VP4 muss erlaubt sein. |
 | „Nachricht konnte nicht entschlüsselt werden" | Ihr habt unterschiedliche gemeinsame Schlüssel eingetragen. Einer erzeugt einen neuen, schickt ihn dem anderen, beide tragen genau denselben ein. |
@@ -150,13 +189,17 @@ Wiederherstellungsmöglichkeit wäre auch ein Weg für jemand anderen.
 
 ## Selbst bauen
 
+Der Quelltext liegt unter **[github.com/FarHeadphone2753/VP4](https://github.com/FarHeadphone2753/VP4)**.
 Du brauchst Python 3.9 oder neuer.
 
 ```bash
-pip install cryptography argon2-cffi customtkinter pillow pyinstaller
+git clone https://github.com/FarHeadphone2753/VP4.git
+cd VP4
+
+pip install cryptography argon2-cffi customtkinter pillow pyinstaller discord.py
 
 python VP4.py        # direkt starten
-python test_vp4.py   # Selbsttest (151 Prüfungen)
+python test_vp4.py   # Selbsttest (241 Prüfungen)
 python bauen.py      # eigene VP4.exe erzeugen -> dist/VP4.exe
 ```
 
@@ -169,7 +212,9 @@ python bauen.py      # eigene VP4.exe erzeugen -> dist/VP4.exe
 | `krypto.py` | Alle Verfahren, Signaturen, Prüfsummen |
 | `dateien.py` | Dateien und Ordner als `.vp4`-Container |
 | `speicher.py` | Schlüsselspeicher, Einstellungen, Obsidian |
-| `chat.py` | LAN-Chat |
+| `chat.py` | Chat im WLAN |
+| `transport.py` | Wählt den Weg: WLAN, Discord oder beides |
+| `discord_transport.py` | Chat über einen Discord-Kanal |
 | `test_vp4.py` | Selbsttest |
 
 Deine Daten liegen in `vp4_daten` neben dem Programm. Dieser Ordner gehört dir
@@ -187,7 +232,14 @@ geprüft.
 Für wirklich Wichtiges – Bankdaten, Passwörter für echte Konten – sollte das
 nicht deine einzige Absicherung sein.
 
-Und eine bekannte Schwäche, die du kennen solltest: Beim Chat wird beim
-Verbindungsaufbau nur **behauptet**, wer man ist – nachgeprüft wird es nicht.
-Wer im selben WLAN sitzt, könnte sich als einer deiner Freunde ausgeben. Unter
-Freunden im Heimnetz ist das in Ordnung, für Vertrauliches nicht.
+Und zwei bekannte Schwächen, die du kennen solltest:
+
+Beim Chat wird beim Verbindungsaufbau nur **behauptet**, wer man ist –
+nachgeprüft wird es nicht. Wer im selben WLAN sitzt oder im selben Discord-Kanal
+ist, könnte sich als einer deiner Freunde ausgeben.
+
+Und der eingebaute Gruppenschlüssel ist eine **Bequemlichkeit, keine
+Sicherheitsverbesserung**: Er sorgt dafür, dass ihr sofort losschreiben könnt,
+schützt euch aber nicht voreinander. Wer dasselbe VP4 hat, liest im Kanal alles
+mit. Für ein Programm unter Freunden ist beides in Ordnung, für Vertrauliches
+nicht – dafür gibt es die eigenen Schlüssel.

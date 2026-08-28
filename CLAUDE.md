@@ -63,7 +63,8 @@ Auf echtem Windows verifiziert: Python 3.13, `cryptography` 46, `argon2-cffi`
 25.1, `customtkinter` 5.2.2, `discord.py` 2.7.1. Alle 241 Prüfungen bestehen,
 alle acht Seiten bauen fehlerfrei auf, Hell/Dunkel lässt sich umschalten. Die
 `VP4.exe` ist gebaut (34 MB, `python bauen.py`) und wird über einen
-GitHub-Workflow veröffentlicht. Der Chat über Discord ist mit einem echten
+GitHub-Workflow veröffentlicht. Das Repository liegt unter
+<https://github.com/FarHeadphone2753/VP4> (privat; Standardzweig `master`). Der Chat über Discord ist mit einem echten
 Bot in einem echten Kanal durchgespielt worden – Text, mehrteilige
 Nachrichten und eine 200-KB-Datei.
 
