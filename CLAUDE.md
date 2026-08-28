@@ -64,7 +64,18 @@ Auf echtem Windows verifiziert: Python 3.13, `cryptography` 46, `argon2-cffi`
 alle acht Seiten bauen fehlerfrei auf, Hell/Dunkel lässt sich umschalten. Die
 `VP4.exe` ist gebaut (34 MB, `python bauen.py`) und wird über einen
 GitHub-Workflow veröffentlicht. Das Repository liegt unter
-<https://github.com/FarHeadphone2753/VP4> (privat; Standardzweig `master`). Der Chat über Discord ist mit einem echten
+<https://github.com/FarHeadphone2753/VP4> (öffentlich; Standardzweig
+`master`).
+
+**Weil es öffentlich ist, dürfen die drei Secrets `DISCORD_BOT_TOKEN`,
+`DISCORD_KANAL_ID` und `VP4_GRUPPEN_SCHLUESSEL` dort nicht hinterlegt
+werden.** Sonst hinge an jedem Release eine `.exe`, aus der sich Token und
+Gruppenschlüssel herausholen lassen – und zwar von jedem, nicht nur von
+Leons Freunden. `discord_konfig.py` sagt es selbst: „Diese .exe sollte man
+nicht öffentlich zum Download anbieten." Ohne die Secrets läuft der Workflow
+unverändert durch, nur ohne eingebauten Discord-Zugang (der `else`-Zweig in
+`release.yml` schreibt das auch so ins Protokoll). Die `.exe` für Freunde
+entsteht dann lokal mit `python bauen.py` und wird direkt verschickt. Der Chat über Discord ist mit einem echten
 Bot in einem echten Kanal durchgespielt worden – Text, mehrteilige
 Nachrichten und eine 200-KB-Datei.
 
